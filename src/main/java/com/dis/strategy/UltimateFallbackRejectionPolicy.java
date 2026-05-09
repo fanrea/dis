@@ -1,4 +1,4 @@
-﻿package com.dis.strategy;
+package com.dis.strategy;
 
 import java.util.concurrent.RejectedExecutionHandler;
 import java.util.concurrent.ThreadPoolExecutor;

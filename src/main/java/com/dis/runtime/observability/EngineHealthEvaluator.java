@@ -1,4 +1,4 @@
-﻿package com.dis.runtime.observability;
+package com.dis.runtime.observability;
 
 import com.dis.api.EngineHealthReport;
 import com.dis.api.EngineMetricsSnapshot;
@@ -12,11 +12,6 @@ import java.util.List;
 
 /**
  * 健康评估器。
- *
- * 判定规则：
- * 1. 运行中线程死亡 -> DOWN。
- * 2. 积压比例超过阈值 -> DEGRADED 或 DOWN。
- * 3. 发布或阶段出现错误 -> 至少 DEGRADED。
  */
 public final class EngineHealthEvaluator {
     public EngineHealthReport evaluate(EngineMetricsSnapshot snapshot, EngineConfig<?> config) {
@@ -42,11 +37,39 @@ public final class EngineHealthEvaluator {
             details.add(String.format("积压比例偏高: %.2f >= %.2f", snapshot.backlogRatio(), config.degradedBacklogRatio()));
         }
 
-        if (snapshot.publishErrorCount() > 0) {
+        if (snapshot.publishTranslateFailedCount() > 0) {
             if (level == HealthLevel.UP) {
                 level = HealthLevel.DEGRADED;
             }
-            details.add("发布路径出现异常，累计失败数: " + snapshot.publishErrorCount());
+            details.add("发布翻译失败数: " + snapshot.publishTranslateFailedCount());
+        }
+
+        if (snapshot.publishTimeoutCount() > 0) {
+            if (level == HealthLevel.UP) {
+                level = HealthLevel.DEGRADED;
+            }
+            details.add("发布超时数: " + snapshot.publishTimeoutCount());
+        }
+
+        if (snapshot.handlerRetryCount() > 0) {
+            if (level == HealthLevel.UP) {
+                level = HealthLevel.DEGRADED;
+            }
+            details.add("处理重试数: " + snapshot.handlerRetryCount());
+        }
+
+        if (snapshot.deadLetterCount() > 0) {
+            if (level == HealthLevel.UP) {
+                level = HealthLevel.DEGRADED;
+            }
+            details.add("死信数: " + snapshot.deadLetterCount());
+        }
+
+        if (snapshot.gracefulShutdownTimeoutCount() > 0) {
+            if (level == HealthLevel.UP) {
+                level = HealthLevel.DEGRADED;
+            }
+            details.add("优雅停机超时数: " + snapshot.gracefulShutdownTimeoutCount());
         }
 
         for (StageMetricsSnapshot stage : snapshot.stages()) {
@@ -54,7 +77,7 @@ public final class EngineHealthEvaluator {
                 if (level == HealthLevel.UP) {
                     level = HealthLevel.DEGRADED;
                 }
-                details.add("阶段出现异常: " + stage.stageName() + "，累计失败数: " + stage.errorCount());
+                details.add("阶段错误: " + stage.stageName() + "，累计失败数: " + stage.errorCount());
             }
         }
 

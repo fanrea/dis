@@ -5,6 +5,8 @@ import com.dis.strategy.WaitStrategy;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Arrays;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
 
 public final class MultiProducerSequencer implements Sequencer {
@@ -37,27 +39,53 @@ public final class MultiProducerSequencer implements Sequencer {
 
     @Override
     public long next() {
-        long current;
-        long next;
-        long wrapPoint;
+        return claimNext(false, 0L, 0L);
+    }
+
+    @Override
+    public long tryNext(long timeout, TimeUnit unit) {
+        Objects.requireNonNull(unit, "unit");
+        if (timeout < 0) {
+            throw new IllegalArgumentException("timeout must be >= 0");
+        }
+        long timeoutNanos = unit.toNanos(timeout);
+        if (timeout > 0 && timeoutNanos <= 0) {
+            timeoutNanos = Long.MAX_VALUE;
+        }
+        long start = System.nanoTime();
+        return claimNext(true, timeoutNanos, start);
+    }
+
+    private long claimNext(boolean timed, long timeoutNanos, long startTime) {
         long cachedGatingSequence = cursor.getVolatile() - bufferSize;
 
-        do {
-            current = cursor.getVolatile();
-            next = current + 1;
-            wrapPoint = next - bufferSize;
+        while (true) {
+            long current = cursor.getVolatile();
+            long next = current + 1;
+            long wrapPoint = next - bufferSize;
 
             if (wrapPoint > cachedGatingSequence) {
                 long minSequence = getMinimumSequence(gatingSequences, current);
                 if (wrapPoint > minSequence) {
-                    LockSupport.parkNanos(1L);
+                    if (timed) {
+                        long elapsed = System.nanoTime() - startTime;
+                        if (elapsed >= timeoutNanos) {
+                            return -1L;
+                        }
+                        long remaining = timeoutNanos - elapsed;
+                        LockSupport.parkNanos(Math.min(remaining, 1_000_000L));
+                    } else {
+                        LockSupport.parkNanos(1L);
+                    }
                     continue;
                 }
                 cachedGatingSequence = minSequence;
             }
-        } while (!cursor.compareAndSet(current, next));
 
-        return next;
+            if (cursor.compareAndSet(current, next)) {
+                return next;
+            }
+        }
     }
 
     @Override

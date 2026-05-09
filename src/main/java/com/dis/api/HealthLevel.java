@@ -1,4 +1,4 @@
-﻿package com.dis.api;
+package com.dis.api;
 
 /**
  * 健康等级：

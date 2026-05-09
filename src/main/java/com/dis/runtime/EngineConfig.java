@@ -1,5 +1,9 @@
-﻿package com.dis.runtime;
+package com.dis.runtime;
 
+import com.dis.api.DeadLetterEvent;
+import com.dis.api.DeadLetterHandler;
+import com.dis.api.EventResetter;
+import com.dis.api.RetryPolicy;
 import com.dis.handler.ExceptionHandler;
 import com.dis.handler.FatalExceptionHandler;
 import com.dis.strategy.BlockingWaitStrategy;
@@ -23,6 +27,9 @@ public final class EngineConfig<E> {
     private final WaitStrategy waitStrategy;
     private final ExceptionHandler<E> exceptionHandler;
     private final ThreadFactory threadFactory;
+    private final EventResetter<E> eventResetter;
+    private final RetryPolicy retryPolicy;
+    private final DeadLetterHandler<E> deadLetterHandler;
 
     // 可观测性配置。
     private final boolean observabilityLogEnabled;
@@ -36,6 +43,10 @@ public final class EngineConfig<E> {
         this.waitStrategy = Objects.requireNonNullElseGet(builder.waitStrategy, BlockingWaitStrategy::new);
         this.exceptionHandler = Objects.requireNonNullElseGet(builder.exceptionHandler, FatalExceptionHandler::new);
         this.threadFactory = Objects.requireNonNullElseGet(builder.threadFactory, DefaultThreadFactory::new);
+        this.eventResetter = Objects.requireNonNullElseGet(builder.eventResetter, () -> event -> {
+        });
+        this.retryPolicy = Objects.requireNonNullElseGet(builder.retryPolicy, RetryPolicy::noRetry);
+        this.deadLetterHandler = Objects.requireNonNullElseGet(builder.deadLetterHandler, DefaultDeadLetterHandler::new);
         this.observabilityLogEnabled = builder.observabilityLogEnabled;
         this.observabilityLogIntervalSeconds = builder.observabilityLogIntervalSeconds;
         this.degradedBacklogRatio = builder.degradedBacklogRatio;
@@ -60,6 +71,18 @@ public final class EngineConfig<E> {
 
     public ThreadFactory threadFactory() {
         return threadFactory;
+    }
+
+    public EventResetter<E> eventResetter() {
+        return eventResetter;
+    }
+
+    public RetryPolicy retryPolicy() {
+        return retryPolicy;
+    }
+
+    public DeadLetterHandler<E> deadLetterHandler() {
+        return deadLetterHandler;
     }
 
     public boolean observabilityLogEnabled() {
@@ -88,6 +111,9 @@ public final class EngineConfig<E> {
         private WaitStrategy waitStrategy;
         private ExceptionHandler<E> exceptionHandler;
         private ThreadFactory threadFactory;
+        private EventResetter<E> eventResetter;
+        private RetryPolicy retryPolicy;
+        private DeadLetterHandler<E> deadLetterHandler;
 
         private boolean observabilityLogEnabled = true;
         private long observabilityLogIntervalSeconds = 15;
@@ -95,7 +121,7 @@ public final class EngineConfig<E> {
         private double downBacklogRatio = 0.95;
 
         private Builder(Supplier<E> eventFactory) {
-            this.eventFactory = eventFactory;
+            this.eventFactory = Objects.requireNonNull(eventFactory, "eventFactory");
         }
 
         public Builder<E> bufferSize(int bufferSize) {
@@ -118,6 +144,21 @@ public final class EngineConfig<E> {
 
         public Builder<E> threadFactory(ThreadFactory threadFactory) {
             this.threadFactory = threadFactory;
+            return this;
+        }
+
+        public Builder<E> eventResetter(EventResetter<E> eventResetter) {
+            this.eventResetter = eventResetter;
+            return this;
+        }
+
+        public Builder<E> retryPolicy(RetryPolicy retryPolicy) {
+            this.retryPolicy = retryPolicy;
+            return this;
+        }
+
+        public Builder<E> deadLetterHandler(DeadLetterHandler<E> deadLetterHandler) {
+            this.deadLetterHandler = deadLetterHandler;
             return this;
         }
 
@@ -166,6 +207,19 @@ public final class EngineConfig<E> {
             Thread t = new Thread(r, "dis-engine-" + idx.getAndIncrement());
             t.setDaemon(false);
             return t;
+        }
+    }
+
+    private static final class DefaultDeadLetterHandler<E> implements DeadLetterHandler<E> {
+        @Override
+        public void onDeadLetter(DeadLetterEvent<E> event) {
+            System.err.println("DeadLetter | stage=" + event.stageName()
+                    + " | seq=" + event.sequence()
+                    + " | attempts=" + event.attempts()
+                    + " | cause=" + event.cause());
+            if (event.cause() != null) {
+                event.cause().printStackTrace(System.err);
+            }
         }
     }
 }

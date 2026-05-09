@@ -1,79 +1,179 @@
 package com.dis;
 
-import com.dis.core.BatchEventProcessor;
-import com.dis.core.MultiProducerSequencer;
-import com.dis.core.RingBuffer;
-import com.dis.handler.BenchmarkEventHandler;
-import com.dis.handler.FatalExceptionHandler;
-import com.dis.handler.LowEventHandler;
-import com.dis.strategy.WaitStrategy;
-import com.dis.strategy.YieldingWaitStrategy;
+import com.dis.runtime.DefaultEventEngine;
+import com.dis.runtime.EngineConfig;
 
+import java.util.Arrays;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class DisruptorBenchmark {
-    private static final int EVENT_COUNT = 50_000;
-    private static final int PRODUCER_COUNT = 4;
+    private static final int EVENT_COUNT = 200;
+    private static final int BUFFER_SIZE = 65_536;
+    private static final int[] PRODUCER_COUNTS = {1, 4};
 
     public static void main(String[] args) throws Exception {
-        int bufferSize = 65536;
+        System.out.println("events=" + EVENT_COUNT + ", bufferSize=" + BUFFER_SIZE);
+        for (int producerCount : PRODUCER_COUNTS) {
+            BenchmarkReport engineReport = runEngineScenario(producerCount);
+            BenchmarkReport queueReport = runBlockingQueueScenario(producerCount);
+            System.out.println(formatReport("engine", producerCount, engineReport));
+            System.out.println(formatReport("arrayBlockingQueue", producerCount, queueReport));
+            System.out.println("----");
+        }
+    }
 
-        RingBuffer<OrderEvent> ringBuffer = new RingBuffer<>(bufferSize, OrderEvent::new);
-        WaitStrategy waitStrategy = new YieldingWaitStrategy();
-        MultiProducerSequencer sequencer = new MultiProducerSequencer(bufferSize, waitStrategy);
+    private static BenchmarkReport runEngineScenario(int producerCount) throws Exception {
+        CountDownLatch consumedLatch = new CountDownLatch(EVENT_COUNT);
+        long[] latencies = new long[EVENT_COUNT];
+        AtomicInteger latencyIndex = new AtomicInteger();
 
-        CountDownLatch consumerLatch = new CountDownLatch(1);
-        BenchmarkEventHandler handler = new BenchmarkEventHandler(consumerLatch, EVENT_COUNT);
-        LowEventHandler lowHandler = new LowEventHandler();
-
-        BatchEventProcessor<OrderEvent> high = new BatchEventProcessor<>(
-                ringBuffer, sequencer, null, waitStrategy, handler, new FatalExceptionHandler<>()
+        DefaultEventEngine<BenchmarkEvent> engine = DefaultEventEngine.create(
+                EngineConfig.<BenchmarkEvent>builder(BenchmarkEvent::new)
+                        .bufferSize(BUFFER_SIZE)
+                        .eventResetter(BenchmarkEvent::reset)
+                        .observabilityLogEnabled(false)
+                        .build()
         );
-        BatchEventProcessor<OrderEvent> low = new BatchEventProcessor<>(
-                ringBuffer, sequencer, high.getSequence(), waitStrategy, lowHandler, new FatalExceptionHandler<>()
-        );
 
-        sequencer.addGatingSequence(high.getSequence());
-        sequencer.addGatingSequence(low.getSequence());
+        engine.handleEventsWith("benchmark-stage", (event, sequence) -> {
+            long latency = System.nanoTime() - event.publishedAtNanos;
+            int index = latencyIndex.getAndIncrement();
+            latencies[index] = latency;
+            consumedLatch.countDown();
+        });
 
-        new Thread(high, "Benchmark-Consumer").start();
-        new Thread(low, "Low-Consumer").start();
-
-        ExecutorService executor = Executors.newFixedThreadPool(PRODUCER_COUNT);
-        int countPerProducer = EVENT_COUNT / PRODUCER_COUNT;
-
-        System.out.println("========== benchmark start ==========");
-        System.out.println("event count: " + EVENT_COUNT);
-        System.out.println("producer threads: " + PRODUCER_COUNT);
-        System.out.println("wait strategy: YieldingWaitStrategy");
-        System.out.println("ring buffer size: " + bufferSize);
-
-        long startTime = System.currentTimeMillis();
-
-        for (int i = 0; i < PRODUCER_COUNT; i++) {
-            executor.submit(() -> {
-                for (int j = 0; j < countPerProducer; j++) {
-                    long seq = sequencer.next();
-                    ringBuffer.get(seq).setValues("TX-ORDER", 199);
-                    sequencer.publish(seq);
+        engine.start();
+        ExecutorService producerPool = Executors.newFixedThreadPool(producerCount);
+        int perProducer = EVENT_COUNT / producerCount;
+        long start = System.nanoTime();
+        for (int i = 0; i < producerCount; i++) {
+            producerPool.submit(() -> {
+                for (int j = 0; j < perProducer; j++) {
+                    engine.publisher().publishEvent((event, sequence) -> event.publishedAtNanos = System.nanoTime());
                 }
             });
         }
 
-        consumerLatch.await();
+        producerPool.shutdown();
+        producerPool.awaitTermination(10, TimeUnit.MINUTES);
+        consumedLatch.await(10, TimeUnit.MINUTES);
+        long elapsedNanos = System.nanoTime() - start;
 
-        long endTime = System.currentTimeMillis();
-        long costTimeMs = endTime - startTime;
-        long tps = (EVENT_COUNT * 1000L) / Math.max(1, costTimeMs);
+        boolean drained = engine.shutdownGracefully(30, TimeUnit.SECONDS);
+        if (!drained) {
+            engine.shutdown();
+        }
+        engine.awaitShutdown(30, TimeUnit.SECONDS);
+        return new BenchmarkReport(elapsedNanos, latencies);
+    }
 
-        System.out.println("========== benchmark report ==========");
-        System.out.println("cost(ms): " + costTimeMs);
-        System.out.println("throughput(ops/sec): " + tps);
+    private static BenchmarkReport runBlockingQueueScenario(int producerCount) throws Exception {
+        CountDownLatch consumedLatch = new CountDownLatch(EVENT_COUNT);
+        long[] latencies = new long[EVENT_COUNT];
+        AtomicInteger latencyIndex = new AtomicInteger();
+        ArrayBlockingQueue<BenchmarkEvent> queue = new ArrayBlockingQueue<>(BUFFER_SIZE);
 
-        high.halt();
-        low.halt();
-        executor.shutdown();
+        ExecutorService consumer = Executors.newSingleThreadExecutor();
+        consumer.submit(() -> {
+            try {
+                while (consumedLatch.getCount() > 0) {
+                    BenchmarkEvent event = queue.poll(100, TimeUnit.MILLISECONDS);
+                    if (event == null) {
+                        continue;
+                    }
+                    int index = latencyIndex.getAndIncrement();
+                    latencies[index] = System.nanoTime() - event.publishedAtNanos;
+                    consumedLatch.countDown();
+                }
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        ExecutorService producerPool = Executors.newFixedThreadPool(producerCount);
+        int perProducer = EVENT_COUNT / producerCount;
+        long start = System.nanoTime();
+        for (int i = 0; i < producerCount; i++) {
+            producerPool.submit(() -> {
+                for (int j = 0; j < perProducer; j++) {
+                    try {
+                        queue.put(BenchmarkEvent.of(System.nanoTime()));
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            });
+        }
+
+        producerPool.shutdown();
+        producerPool.awaitTermination(10, TimeUnit.MINUTES);
+        consumedLatch.await(10, TimeUnit.MINUTES);
+        long elapsedNanos = System.nanoTime() - start;
+
+        consumer.shutdownNow();
+        consumer.awaitTermination(1, TimeUnit.MINUTES);
+        producerPool.shutdownNow();
+        producerPool.awaitTermination(1, TimeUnit.MINUTES);
+
+        return new BenchmarkReport(elapsedNanos, latencies);
+    }
+
+    private static String formatReport(String name, int producerCount, BenchmarkReport report) {
+        return String.format(
+                "%s | producers=%d | throughput=%.2f ops/s | p99=%.2f us | avg=%.2f us",
+                name,
+                producerCount,
+                report.throughput(),
+                report.p99Micros(),
+                report.avgMicros()
+        );
+    }
+
+    private static final class BenchmarkReport {
+        private final long elapsedNanos;
+        private final long[] latencies;
+
+        private BenchmarkReport(long elapsedNanos, long[] latencies) {
+            this.elapsedNanos = elapsedNanos;
+            this.latencies = latencies;
+        }
+
+        private double throughput() {
+            return EVENT_COUNT * 1_000_000_000.0 / Math.max(1L, elapsedNanos);
+        }
+
+        private double avgMicros() {
+            return Arrays.stream(latencies).average().orElse(0.0) / 1_000.0;
+        }
+
+        private double p99Micros() {
+            long[] copy = Arrays.copyOf(latencies, latencies.length);
+            Arrays.sort(copy);
+            int index = Math.min(copy.length - 1, (int) Math.ceil(copy.length * 0.99) - 1);
+            return copy[index] / 1_000.0;
+        }
+    }
+
+    public static final class BenchmarkEvent {
+        private long publishedAtNanos;
+
+        private BenchmarkEvent() {
+        }
+
+        private static BenchmarkEvent of(long publishedAtNanos) {
+            BenchmarkEvent event = new BenchmarkEvent();
+            event.publishedAtNanos = publishedAtNanos;
+            return event;
+        }
+
+        private void reset() {
+            publishedAtNanos = 0L;
+        }
     }
 }

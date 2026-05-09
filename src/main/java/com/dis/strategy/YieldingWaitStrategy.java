@@ -1,4 +1,4 @@
-﻿package com.dis.strategy;
+package com.dis.strategy;
 
 import com.dis.core.Sequence;
 

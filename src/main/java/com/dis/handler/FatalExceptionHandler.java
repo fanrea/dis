@@ -1,4 +1,4 @@
-﻿package com.dis.handler;
+package com.dis.handler;
 
 public final class FatalExceptionHandler<E> implements ExceptionHandler<E> {
     @Override

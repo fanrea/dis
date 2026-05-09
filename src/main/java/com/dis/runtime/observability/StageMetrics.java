@@ -1,4 +1,4 @@
-﻿package com.dis.runtime.observability;
+package com.dis.runtime.observability;
 
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -8,10 +8,14 @@ import java.util.concurrent.atomic.LongAdder;
  */
 public final class StageMetrics {
     private final String stageName;
-    private final LongAdder consumed = new LongAdder();
-    private final LongAdder errors = new LongAdder();
+    private final LongAdder successCount = new LongAdder();
+    private final LongAdder errorCount = new LongAdder();
+    private final LongAdder retryCount = new LongAdder();
+    private final LongAdder deadLetterCount = new LongAdder();
+    private final LongAdder skippedCount = new LongAdder();
     private final LatencyWindow latencyWindow = new LatencyWindow(4096);
     private final AtomicLong lastSequence = new AtomicLong(-1L);
+    private volatile String lastErrorMessageText;
 
     public StageMetrics(String stageName) {
         this.stageName = stageName;
@@ -22,30 +26,75 @@ public final class StageMetrics {
     }
 
     public void recordSuccess(long sequence, long latencyNanos) {
-        consumed.increment();
+        successCount.increment();
         latencyWindow.recordNanos(latencyNanos);
         lastSequence.set(sequence);
     }
 
-    public void recordError(long sequence, long latencyNanos) {
-        errors.increment();
+    public void recordRetry(long sequence, long latencyNanos, Throwable cause) {
+        retryCount.increment();
         latencyWindow.recordNanos(latencyNanos);
         lastSequence.set(sequence);
+        lastErrorMessageText = messageOf(cause);
     }
 
-    public long consumedCount() {
-        return consumed.sum();
+    public void recordError(long sequence, long latencyNanos, Throwable cause) {
+        errorCount.increment();
+        latencyWindow.recordNanos(latencyNanos);
+        lastSequence.set(sequence);
+        lastErrorMessageText = messageOf(cause);
+    }
+
+    public void recordDeadLetter(long sequence, long latencyNanos, Throwable cause) {
+        deadLetterCount.increment();
+        latencyWindow.recordNanos(latencyNanos);
+        lastSequence.set(sequence);
+        lastErrorMessageText = messageOf(cause);
+    }
+
+    public void recordSkippedPublishFailure(long sequence, Throwable cause) {
+        skippedCount.increment();
+        lastSequence.set(sequence);
+        lastErrorMessageText = messageOf(cause);
+    }
+
+    public long successCount() {
+        return successCount.sum();
     }
 
     public long errorCount() {
-        return errors.sum();
+        return errorCount.sum();
+    }
+
+    public long retryCount() {
+        return retryCount.sum();
+    }
+
+    public long deadLetterCount() {
+        return deadLetterCount.sum();
+    }
+
+    public long skippedCount() {
+        return skippedCount.sum();
+    }
+
+    public long consumedCount() {
+        return successCount();
     }
 
     public long lastSequence() {
         return lastSequence.get();
     }
 
+    public String lastErrorMessage() {
+        return lastErrorMessageText;
+    }
+
     public LatencyWindow.Stats latencyStats() {
         return latencyWindow.snapshot();
+    }
+
+    private static String messageOf(Throwable cause) {
+        return cause == null ? null : cause.getMessage();
     }
 }

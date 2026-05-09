@@ -1,4 +1,4 @@
-﻿package com.dis.runtime.observability;
+package com.dis.runtime.observability;
 
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;

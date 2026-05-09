@@ -1,4 +1,4 @@
-﻿package com.dis.runtime;
+package com.dis.runtime;
 
 import com.dis.core.Sequence;
 
