@@ -4,6 +4,12 @@ import com.dis.OrderEvent;
 import com.dis.api.EventPublisher;
 import com.dis.core.MultiProducerSequencer;
 import com.dis.core.Sequence;
+import com.dis.strategy.BatchSignalPolicy;
+import com.dis.strategy.BlockingWaitStrategy;
+import com.dis.strategy.PhasedBackoffWaitStrategy;
+import com.dis.strategy.PublishSignalPolicy;
+import com.dis.strategy.RateLimitedSignalPolicy;
+import com.dis.strategy.WaitStrategy;
 import com.dis.strategy.YieldingWaitStrategy;
 import com.dis.api.DeadLetterEvent;
 import com.dis.api.RetryPolicy;
@@ -347,6 +353,176 @@ class DefaultEventEngineTest {
         engine.awaitShutdown(3, TimeUnit.SECONDS);
     }
 
+    @Test
+    void yieldingWaitStrategySupportsTunableBackoff() throws Exception {
+        WaitStrategy strategy = new YieldingWaitStrategy(8, 4, 1_000L);
+        MultiProducerSequencer sequencer = new MultiProducerSequencer(4, strategy);
+        Sequence dependent = sequencer.cursorSequence();
+
+        long claimed = sequencer.next();
+        sequencer.publish(claimed);
+        long available = strategy.waitFor(0L, sequencer.cursorSequence(), dependent);
+        assertTrue(available >= 0L);
+    }
+
+    @Test
+    void phasedBackoffWaitStrategyWorksForPublishedSequence() throws Exception {
+        WaitStrategy strategy = new PhasedBackoffWaitStrategy(16, 8, 1_000L);
+        MultiProducerSequencer sequencer = new MultiProducerSequencer(4, strategy);
+        Sequence dependent = sequencer.cursorSequence();
+
+        long claimed = sequencer.next();
+        sequencer.publish(claimed);
+        long available = strategy.waitFor(0L, sequencer.cursorSequence(), dependent);
+        assertTrue(available >= 0L);
+    }
+
+    @Test
+    void phasedBackoffReboundsWhenProgressResumes() throws Exception {
+        Sequence cursor = new Sequence(-1);
+        Sequence dependent = new Sequence(-1);
+        WaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                0,
+                0,
+                1_000L,
+                64_000L,
+                2,
+                32,
+                16,
+                4L,
+                2
+        );
+
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<Long> elapsed = new AtomicReference<>();
+        Thread waiter = new Thread(() -> {
+            long start = System.nanoTime();
+            try {
+                strategy.waitFor(5L, cursor, dependent);
+                elapsed.set(System.nanoTime() - start);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        });
+        waiter.start();
+
+        // 模拟一段低负载空闲（进入 park 退避）。
+        Thread.sleep(5);
+        // 模拟负载回升：依赖序列逐步推进。
+        for (int i = 0; i <= 5; i++) {
+            dependent.setRelease(i);
+            Thread.sleep(1);
+        }
+
+        assertTrue(done.await(1, TimeUnit.SECONDS));
+        assertNotNull(elapsed.get());
+        assertTrue(elapsed.get() < TimeUnit.MILLISECONDS.toNanos(300));
+    }
+
+    @Test
+    void phasedBackoffReboundUsesHysteresisNotSingleTick() throws Exception {
+        Sequence cursor = new Sequence(-1);
+        Sequence dependent = new Sequence(-1);
+        WaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                0,
+                0,
+                5_000L,
+                80_000L,
+                2,
+                32,
+                16,
+                8L,
+                3
+        );
+
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<Long> elapsed = new AtomicReference<>();
+        Thread waiter = new Thread(() -> {
+            long start = System.nanoTime();
+            try {
+                strategy.waitFor(6L, cursor, dependent);
+                elapsed.set(System.nanoTime() - start);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        });
+        waiter.start();
+
+        // 先给一次小推进，不应触发激进回弹。
+        Thread.sleep(4);
+        dependent.setRelease(1);
+        Thread.sleep(4);
+
+        // 再给连续推进，达到阈值后应回弹并较快完成。
+        for (int i = 2; i <= 6; i++) {
+            dependent.setRelease(i);
+            Thread.sleep(1);
+        }
+
+        assertTrue(done.await(1, TimeUnit.SECONDS));
+        assertNotNull(elapsed.get());
+        assertTrue(elapsed.get() < TimeUnit.MILLISECONDS.toNanos(500));
+    }
+
+    @Test
+    void batchSignalPolicySignalsOncePerBatch() {
+        CountingWaitStrategy waitStrategy = new CountingWaitStrategy();
+        PublishSignalPolicy policy = new BatchSignalPolicy(3);
+        MultiProducerSequencer sequencer = new MultiProducerSequencer(16, waitStrategy, policy);
+
+        for (int i = 0; i < 6; i++) {
+            long sequence = sequencer.next();
+            sequencer.publish(sequence);
+        }
+
+        assertEquals(2, waitStrategy.signalCount.get());
+    }
+
+    @Test
+    void rateLimitedSignalPolicySuppressesBurstSignals() {
+        CountingWaitStrategy waitStrategy = new CountingWaitStrategy();
+        PublishSignalPolicy policy = new RateLimitedSignalPolicy(1, TimeUnit.SECONDS);
+        MultiProducerSequencer sequencer = new MultiProducerSequencer(16, waitStrategy, policy);
+
+        for (int i = 0; i < 8; i++) {
+            long sequence = sequencer.next();
+            sequencer.publish(sequence);
+        }
+
+        // 限频策略的重点是“抑制突发唤醒”，不是保证首次一定唤醒。
+        assertTrue(waitStrategy.signalCount.get() <= 1);
+    }
+
+    @Test
+    void blockingWaitStrategyCanProgressWithoutSignal() throws Exception {
+        BlockingWaitStrategy waitStrategy = new BlockingWaitStrategy(TimeUnit.MICROSECONDS.toNanos(50));
+        Sequence cursor = new Sequence(-1);
+        Sequence dependent = cursor;
+
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<Long> availableRef = new AtomicReference<>();
+        Thread waiter = new Thread(() -> {
+            try {
+                long available = waitStrategy.waitFor(0L, cursor, dependent);
+                availableRef.set(available);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        });
+        waiter.start();
+
+        Thread.sleep(2);
+        cursor.setRelease(0L);
+        assertTrue(done.await(1, TimeUnit.SECONDS));
+        assertEquals(0L, availableRef.get());
+    }
+
     private static OrderEvent copy(OrderEvent source) {
         OrderEvent copy = new OrderEvent();
         copy.setOrderId(source.getOrderId());
@@ -378,5 +554,19 @@ class DefaultEventEngineTest {
             public void handleOnShutdownException(Throwable ex) {
             }
         };
+    }
+
+    private static final class CountingWaitStrategy implements WaitStrategy {
+        private final AtomicInteger signalCount = new AtomicInteger();
+
+        @Override
+        public long waitFor(long sequence, Sequence cursor, Sequence dependentSequence) {
+            return dependentSequence.getVolatile();
+        }
+
+        @Override
+        public void signalAllWhenBlocking() {
+            signalCount.incrementAndGet();
+        }
     }
 }

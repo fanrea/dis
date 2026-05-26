@@ -10,9 +10,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.LongAdder;
 
-/**
- * 引擎级指标收集器。
- */
+// 引擎级指标收集器。
 public final class EngineMetricsCollector {
     private final LongAdder published = new LongAdder();
     private final LongAdder publishErrors = new LongAdder();
@@ -27,6 +25,7 @@ public final class EngineMetricsCollector {
     private final ConcurrentMap<String, StageMetrics> stageMetricsMap = new ConcurrentHashMap<>();
 
     public StageMetrics registerStage(String stageName) {
+        // stage 名称作为稳定维度，确保同名 stage 的指标持续累计。
         return stageMetricsMap.computeIfAbsent(stageName, StageMetrics::new);
     }
 
@@ -72,6 +71,7 @@ public final class EngineMetricsCollector {
                                           long minConsumerSequence,
                                           int bufferSize,
                                           List<StageRuntimeView> runtimeViews) {
+        // lag/backlogRatio 表示全局积压，供健康评估直接使用。
         long lag = Math.max(0, cursor - minConsumerSequence);
         double backlogRatio = bufferSize <= 0 ? 0.0 : Math.min(1.0, lag * 1.0 / bufferSize);
 

@@ -4,14 +4,11 @@ import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 
-/**
- * 固定窗口延迟采样器。
- *
- * 目标：
- * 1. 写入无锁，适合高频路径。
- * 2. 快照时计算近似分位数。
- * 3. 固定内存占用。
- */
+// 固定窗口延迟采样器。
+// 目标：
+// 1. 写入无锁，适合高频路径。
+// 2. 快照时计算近似分位数。
+// 3. 内存占用固定。
 public final class LatencyWindow {
     private final AtomicLongArray values;
     private final int capacity;
@@ -19,7 +16,7 @@ public final class LatencyWindow {
 
     public LatencyWindow(int capacity) {
         if (capacity <= 0) {
-            throw new IllegalArgumentException("capacity must be > 0");
+            throw new IllegalArgumentException("容量必须大于 0");
         }
         this.capacity = capacity;
         this.values = new AtomicLongArray(capacity);

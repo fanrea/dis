@@ -1,5 +1,6 @@
 package com.dis.benchmark;
 
+// JMH 启动入口。
 public final class JmhBenchmarkMain {
     private JmhBenchmarkMain() {
     }

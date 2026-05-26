@@ -1,5 +1,6 @@
 package com.dis;
 
+// 订单处理状态机。
 public enum OrderEventStatus {
     NEW,
     VALIDATED,

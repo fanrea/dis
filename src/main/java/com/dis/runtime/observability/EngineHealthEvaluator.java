@@ -10,9 +10,11 @@ import com.dis.runtime.EngineState;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * 健康评估器。
- */
+// 健康评估器。
+// 评估优先级：
+// 1. 不可用信号（线程死亡、严重积压）优先判定 DOWN。
+// 2. 其次是降级信号（翻译失败、超时、重试、死信、一般错误）。
+// 3. 无异常信号判定 UP。
 public final class EngineHealthEvaluator {
     public EngineHealthReport evaluate(EngineMetricsSnapshot snapshot, EngineConfig<?> config) {
         List<String> details = new ArrayList<>();
@@ -22,54 +24,54 @@ public final class EngineHealthEvaluator {
             for (StageMetricsSnapshot stage : snapshot.stages()) {
                 if (!stage.workerAlive()) {
                     level = HealthLevel.DOWN;
-                    details.add("阶段线程已退出: " + stage.stageName());
+                    details.add("阶段工作线程已退出：" + stage.stageName());
                 }
             }
         }
 
         if (snapshot.backlogRatio() >= config.downBacklogRatio()) {
             level = HealthLevel.DOWN;
-            details.add(String.format("积压比例过高: %.2f >= %.2f", snapshot.backlogRatio(), config.downBacklogRatio()));
+            details.add(String.format("积压过高：%.2f >= %.2f", snapshot.backlogRatio(), config.downBacklogRatio()));
         } else if (snapshot.backlogRatio() >= config.degradedBacklogRatio()) {
             if (level != HealthLevel.DOWN) {
                 level = HealthLevel.DEGRADED;
             }
-            details.add(String.format("积压比例偏高: %.2f >= %.2f", snapshot.backlogRatio(), config.degradedBacklogRatio()));
+            details.add(String.format("积压升高：%.2f >= %.2f", snapshot.backlogRatio(), config.degradedBacklogRatio()));
         }
 
         if (snapshot.publishTranslateFailedCount() > 0) {
             if (level == HealthLevel.UP) {
                 level = HealthLevel.DEGRADED;
             }
-            details.add("发布翻译失败数: " + snapshot.publishTranslateFailedCount());
+            details.add("发布转换失败次数=" + snapshot.publishTranslateFailedCount());
         }
 
         if (snapshot.publishTimeoutCount() > 0) {
             if (level == HealthLevel.UP) {
                 level = HealthLevel.DEGRADED;
             }
-            details.add("发布超时数: " + snapshot.publishTimeoutCount());
+            details.add("发布超时次数=" + snapshot.publishTimeoutCount());
         }
 
         if (snapshot.handlerRetryCount() > 0) {
             if (level == HealthLevel.UP) {
                 level = HealthLevel.DEGRADED;
             }
-            details.add("处理重试数: " + snapshot.handlerRetryCount());
+            details.add("处理器重试次数=" + snapshot.handlerRetryCount());
         }
 
         if (snapshot.deadLetterCount() > 0) {
             if (level == HealthLevel.UP) {
                 level = HealthLevel.DEGRADED;
             }
-            details.add("死信数: " + snapshot.deadLetterCount());
+            details.add("死信次数=" + snapshot.deadLetterCount());
         }
 
         if (snapshot.gracefulShutdownTimeoutCount() > 0) {
             if (level == HealthLevel.UP) {
                 level = HealthLevel.DEGRADED;
             }
-            details.add("优雅停机超时数: " + snapshot.gracefulShutdownTimeoutCount());
+            details.add("优雅停机超时次数=" + snapshot.gracefulShutdownTimeoutCount());
         }
 
         for (StageMetricsSnapshot stage : snapshot.stages()) {
@@ -77,18 +79,18 @@ public final class EngineHealthEvaluator {
                 if (level == HealthLevel.UP) {
                     level = HealthLevel.DEGRADED;
                 }
-                details.add("阶段错误: " + stage.stageName() + "，累计失败数: " + stage.errorCount());
+                details.add("阶段错误：" + stage.stageName() + "，次数=" + stage.errorCount());
             }
         }
 
         if (details.isEmpty()) {
-            details.add("引擎运行正常，未发现异常信号");
+            details.add("引擎健康");
         }
 
         String summary = switch (level) {
-            case UP -> "状态正常";
-            case DEGRADED -> "状态降级";
-            case DOWN -> "状态不可用";
+            case UP -> "正常";
+            case DEGRADED -> "降级";
+            case DOWN -> "不可用";
         };
 
         return new EngineHealthReport(level, summary, List.copyOf(details), snapshot);

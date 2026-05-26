@@ -6,9 +6,7 @@ import com.dis.api.EngineMetricsSnapshot;
 import java.util.StringJoiner;
 import java.util.logging.Logger;
 
-/**
- * 周期性观测日志输出器。
- */
+// 周期观测日志输出器。
 public final class ObservabilityLogger {
     private static final Logger LOGGER = Logger.getLogger(ObservabilityLogger.class.getName());
 

@@ -9,8 +9,9 @@ import com.dis.runtime.EngineConfig;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+// 最小可运行示例。
 public class EngineQuickStart {
-    
+
     public static void main(String[] args) throws Exception {
         CountDownLatch processed = new CountDownLatch(10);
         DefaultEventEngine<OrderEvent> engine = DefaultEventEngine.create(
@@ -21,15 +22,15 @@ public class EngineQuickStart {
                         .build()
         );
 
-        engine.handleEventsWith("validate-order", (event, sequence) -> {
+        engine.handleEventsWith("校验订单", (event, sequence) -> {
                     event.setOrderId("ORD-" + sequence);
                     event.setStatus("VALIDATED");
                     event.setCreatedAtMillis(System.currentTimeMillis());
                 })
-                .then("enrich-order", (event, sequence) -> {
+                .then("补充订单", (event, sequence) -> {
                     event.setPrice(sequence);
                     if (sequence < 3) {
-                        System.out.println("processed=" + sequence + " " + event);
+                        System.out.println("已处理序号=" + sequence + " " + event);
                     }
                     processed.countDown();
                 });
@@ -53,8 +54,8 @@ public class EngineQuickStart {
         processed.await(3, TimeUnit.SECONDS);
         EngineMetricsSnapshot metrics = engine.metricsSnapshot();
         EngineHealthReport health = engine.healthReport();
-        System.out.println("metrics.globalLag=" + metrics.globalLag());
-        System.out.println("health.level=" + health.level());
+        System.out.println("指标.全局积压=" + metrics.globalLag());
+        System.out.println("健康等级=" + health.level());
 
         engine.shutdownGracefully(3, TimeUnit.SECONDS);
     }

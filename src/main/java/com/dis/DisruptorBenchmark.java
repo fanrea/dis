@@ -11,18 +11,19 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+// 简化版性能对比：本引擎 vs ArrayBlockingQueue。
 public class DisruptorBenchmark {
     private static final int EVENT_COUNT = 200;
     private static final int BUFFER_SIZE = 65_536;
     private static final int[] PRODUCER_COUNTS = {1, 4};
 
     public static void main(String[] args) throws Exception {
-        System.out.println("events=" + EVENT_COUNT + ", bufferSize=" + BUFFER_SIZE);
+        System.out.println("事件数=" + EVENT_COUNT + "，缓冲区大小=" + BUFFER_SIZE);
         for (int producerCount : PRODUCER_COUNTS) {
             BenchmarkReport engineReport = runEngineScenario(producerCount);
             BenchmarkReport queueReport = runBlockingQueueScenario(producerCount);
-            System.out.println(formatReport("engine", producerCount, engineReport));
-            System.out.println(formatReport("arrayBlockingQueue", producerCount, queueReport));
+            System.out.println(formatReport("事件引擎", producerCount, engineReport));
+            System.out.println(formatReport("数组阻塞队列", producerCount, queueReport));
             System.out.println("----");
         }
     }
@@ -40,7 +41,7 @@ public class DisruptorBenchmark {
                         .build()
         );
 
-        engine.handleEventsWith("benchmark-stage", (event, sequence) -> {
+        engine.handleEventsWith("基准测试阶段", (event, sequence) -> {
             long latency = System.nanoTime() - event.publishedAtNanos;
             int index = latencyIndex.getAndIncrement();
             latencies[index] = latency;
@@ -126,7 +127,7 @@ public class DisruptorBenchmark {
 
     private static String formatReport(String name, int producerCount, BenchmarkReport report) {
         return String.format(
-                "%s | producers=%d | throughput=%.2f ops/s | p99=%.2f us | avg=%.2f us",
+                "%s | 生产者数量=%d | 吞吐量=%.2f 次/秒 | P99=%.2f 微秒 | 平均=%.2f 微秒",
                 name,
                 producerCount,
                 report.throughput(),

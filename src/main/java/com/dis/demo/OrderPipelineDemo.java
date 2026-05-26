@@ -16,6 +16,13 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+// 完整流水线示例。
+// 演示点：
+// 1. 多 stage 链路 + WorkerPool。
+// 2. translator 失败跳过。
+// 3. retry + dead letter。
+// 4. tryPublish 超时。
+@SuppressWarnings("all")
 public final class OrderPipelineDemo {
     private OrderPipelineDemo() {
     }
@@ -38,79 +45,79 @@ public final class OrderPipelineDemo {
         Map<String, AtomicInteger> riskAttempts = new ConcurrentHashMap<>();
         Map<String, AtomicInteger> stockAttempts = new ConcurrentHashMap<>();
 
-        engine.handleEventsWith("validate-order", (event, sequence) -> {
+        engine.handleEventsWith("校验订单", (event, sequence) -> {
                     if (isBlank(event.getOrderId()) || isBlank(event.getUserId()) || isBlank(event.getSkuId())) {
                         event.setOrderStatus(OrderEventStatus.FAILED);
-                        event.setErrorCode("INVALID_ORDER");
-                        event.setErrorMessage("missing order fields");
-                        throw new IllegalStateException("missing order fields");
+                        event.setErrorCode("订单无效");
+                        event.setErrorMessage("订单字段缺失");
+                        throw new IllegalStateException("订单字段缺失");
                     }
                     if (event.getPrice() <= 0 || event.getQuantity() <= 0) {
                         event.setOrderStatus(OrderEventStatus.FAILED);
-                        event.setErrorCode("INVALID_ORDER");
-                        event.setErrorMessage("price or quantity is invalid");
-                        throw new IllegalStateException("price or quantity is invalid");
+                        event.setErrorCode("订单无效");
+                        event.setErrorMessage("价格或数量不合法");
+                        throw new IllegalStateException("价格或数量不合法");
                     }
                     event.setOrderStatus(OrderEventStatus.VALIDATED);
-                    System.out.println("[validate-order] " + event.getOrderId() + " ok");
+                    System.out.println("[校验订单] " + event.getOrderId() + " 通过");
                 })
-                .then("risk-check", (event, sequence) -> {
+                .then("风控检查", (event, sequence) -> {
                     AtomicInteger attempt = riskAttempts.computeIfAbsent(event.getOrderId(), key -> new AtomicInteger());
                     if ("ORD-RETRY".equals(event.getOrderId()) && attempt.incrementAndGet() < 3) {
                         event.setOrderStatus(OrderEventStatus.RISK_REJECTED);
-                        event.setErrorCode("RISK_TEMP");
-                        event.setErrorMessage("risk service timeout");
-                        throw new IllegalStateException("risk service timeout");
+                        event.setErrorCode("风控临时异常");
+                        event.setErrorMessage("风控服务超时");
+                        throw new IllegalStateException("风控服务超时");
                     }
                     if ("BLOCKED".equals(event.getUserId())) {
                         event.setOrderStatus(OrderEventStatus.RISK_REJECTED);
-                        event.setErrorCode("RISK_BLOCKED");
-                        event.setErrorMessage("risk rule rejected user");
-                        throw new IllegalStateException("risk rule rejected user");
+                        event.setErrorCode("风控拒绝");
+                        event.setErrorMessage("风控规则拒绝该用户");
+                        throw new IllegalStateException("风控规则拒绝该用户");
                     }
                     event.setRiskPassed(true);
                     event.setOrderStatus(OrderEventStatus.RISK_PASSED);
                     event.setErrorCode(null);
                     event.setErrorMessage(null);
-                    System.out.println("[risk-check] " + event.getOrderId() + " passed");
+                    System.out.println("[风控检查] " + event.getOrderId() + " 通过");
                 })
-                .thenWorkerPool("reserve-stock", 2, event -> {
+                .thenWorkerPool("预占库存", 2, event -> {
                     AtomicInteger attempt = stockAttempts.computeIfAbsent(event.getOrderId(), key -> new AtomicInteger());
                     if ("ORD-DLQ".equals(event.getOrderId())) {
                         event.setOrderStatus(OrderEventStatus.STOCK_FAILED);
-                        event.setErrorCode("STOCK_EMPTY");
-                        event.setErrorMessage("stock exhausted");
-                        throw new IllegalStateException("stock exhausted");
+                        event.setErrorCode("库存不足");
+                        event.setErrorMessage("库存不足");
+                        throw new IllegalStateException("库存不足");
                     }
                     if (!event.isRiskPassed()) {
                         event.setOrderStatus(OrderEventStatus.STOCK_FAILED);
-                        event.setErrorCode("RISK_NOT_PASSED");
-                        event.setErrorMessage("risk check not passed");
-                        throw new IllegalStateException("risk check not passed");
+                        event.setErrorCode("风控未通过");
+                        event.setErrorMessage("风控未通过");
+                        throw new IllegalStateException("风控未通过");
                     }
                     if ("ORD-RETRY".equals(event.getOrderId()) && attempt.incrementAndGet() == 1) {
                         event.setOrderStatus(OrderEventStatus.STOCK_FAILED);
-                        event.setErrorCode("STOCK_TEMP");
-                        event.setErrorMessage("stock reservation busy");
-                        throw new IllegalStateException("stock reservation busy");
+                        event.setErrorCode("库存临时异常");
+                        event.setErrorMessage("库存预占繁忙");
+                        throw new IllegalStateException("库存预占繁忙");
                     }
                     event.setStockReserved(true);
                     event.setOrderStatus(OrderEventStatus.STOCK_RESERVED);
                     event.setErrorCode(null);
                     event.setErrorMessage(null);
-                    System.out.println("[reserve-stock] " + event.getOrderId() + " reserved");
+                    System.out.println("[预占库存] " + event.getOrderId() + " 已预占");
                 })
-                .then("send-notification", (event, sequence) -> {
+                .then("发送通知", (event, sequence) -> {
                     if (event.isRiskPassed() && event.isStockReserved()) {
                         event.setOrderStatus(OrderEventStatus.NOTIFIED);
-                        System.out.println("[send-notification] " + event.getOrderId() + " notified");
+                        System.out.println("[发送通知] " + event.getOrderId() + " 已通知");
                     } else {
                         if (event.getOrderStatus() == null) {
                             event.setOrderStatus(OrderEventStatus.FAILED);
                         }
-                        System.out.println("[send-notification] " + event.getOrderId()
-                                + " skipped, status=" + event.getOrderStatus()
-                                + ", error=" + event.getErrorCode());
+                        System.out.println("[发送通知] " + event.getOrderId()
+                                + " 已跳过，状态=" + event.getOrderStatus()
+                                + "，错误码=" + event.getErrorCode());
                     }
                     pipelineFinished.countDown();
                 });
@@ -121,10 +128,10 @@ public final class OrderPipelineDemo {
         try {
             engine.publisher().publishEvent((event, sequence) -> {
                 event.setOrderId("ORD-PUBLISH-FAILED");
-                throw new IllegalStateException("translator failed before order is ready");
+                throw new IllegalStateException("发布转换器在订单就绪前失败");
             });
         } catch (IllegalStateException ex) {
-            System.out.println("[publish-failed] " + ex.getMessage());
+            System.out.println("[发布失败] " + ex.getMessage());
         }
         publishOrder(engine, "ORD-RETRY", "USER-2", "SKU-2", 299, 2, "trace-2");
         publishOrder(engine, "ORD-DLQ", "USER-3", "SKU-3", 399, 1, "trace-3");
@@ -133,18 +140,18 @@ public final class OrderPipelineDemo {
         pipelineFinished.await(3, TimeUnit.SECONDS);
 
         boolean drained = engine.shutdownGracefully(5, TimeUnit.SECONDS);
-        System.out.println("shutdownGracefully=" + drained);
+        System.out.println("优雅停机结果=" + drained);
 
         EngineMetricsSnapshot metrics = engine.metricsSnapshot();
         EngineHealthReport health = engine.healthReport();
-        System.out.println("metrics.publishTranslateFailedCount=" + metrics.publishTranslateFailedCount());
-        System.out.println("metrics.publishTimeoutCount=" + metrics.publishTimeoutCount());
-        System.out.println("metrics.consumerSkippedTranslateFailedCount=" + metrics.consumerSkippedTranslateFailedCount());
-        System.out.println("metrics.handlerRetryCount=" + metrics.handlerRetryCount());
-        System.out.println("metrics.deadLetterCount=" + metrics.deadLetterCount());
-        System.out.println("metrics.gracefulShutdownCount=" + metrics.gracefulShutdownCount());
-        System.out.println("metrics.gracefulShutdownTimeoutCount=" + metrics.gracefulShutdownTimeoutCount());
-        System.out.println("health=" + health.level() + " | " + health.summary());
+        System.out.println("指标.发布转换失败次数=" + metrics.publishTranslateFailedCount());
+        System.out.println("指标.发布超时次数=" + metrics.publishTimeoutCount());
+        System.out.println("指标.消费者跳过转换失败次数=" + metrics.consumerSkippedTranslateFailedCount());
+        System.out.println("指标.处理器重试次数=" + metrics.handlerRetryCount());
+        System.out.println("指标.死信次数=" + metrics.deadLetterCount());
+        System.out.println("指标.优雅停机次数=" + metrics.gracefulShutdownCount());
+        System.out.println("指标.优雅停机超时次数=" + metrics.gracefulShutdownTimeoutCount());
+        System.out.println("健康状态=" + health.level() + " | " + health.summary());
 
         demoTryPublishTimeout();
     }
@@ -183,7 +190,7 @@ public final class OrderPipelineDemo {
                         .observabilityLogEnabled(false)
                         .build()
         );
-        tinyEngine.handleEventsWith("slow-stage", (event, sequence) -> {
+        tinyEngine.handleEventsWith("慢阶段", (event, sequence) -> {
             entered.countDown();
             release.await(3, TimeUnit.SECONDS);
         });
@@ -195,17 +202,17 @@ public final class OrderPipelineDemo {
                 10,
                 TimeUnit.MILLISECONDS
         );
-        System.out.println("limitedPublishAccepted=" + accepted);
-        System.out.println("limitedPublishTimeoutMetric=" + tinyEngine.metricsSnapshot().publishTimeoutCount());
+        System.out.println("限时发布是否成功=" + accepted);
+        System.out.println("限时发布超时指标=" + tinyEngine.metricsSnapshot().publishTimeoutCount());
         release.countDown();
         tinyEngine.shutdownGracefully(3, TimeUnit.SECONDS);
     }
 
     private static void logDeadLetter(DeadLetterEvent<OrderEvent> event) {
-        System.out.println("[dead-letter] stage=" + event.stageName()
-                + ", seq=" + event.sequence()
-                + ", orderId=" + (event.eventSnapshotOrReference() == null ? null : event.eventSnapshotOrReference().getOrderId())
-                + ", cause=" + event.cause().getMessage());
+        System.out.println("[死信] 阶段=" + event.stageName()
+                + "，序号=" + event.sequence()
+                + "，订单ID=" + (event.eventSnapshotOrReference() == null ? null : event.eventSnapshotOrReference().getOrderId())
+                + "，原因=" + event.cause().getMessage());
     }
 
     private static boolean isBlank(String value) {
@@ -215,19 +222,19 @@ public final class OrderPipelineDemo {
     private static final class DemoExceptionHandler implements ExceptionHandler<OrderEvent> {
         @Override
         public void handleEventException(Throwable ex, long sequence, OrderEvent event) {
-            System.out.println("[handler-error] seq=" + sequence
-                    + ", orderId=" + (event == null ? null : event.getOrderId())
-                    + ", cause=" + ex.getMessage());
+            System.out.println("[处理器异常] 序号=" + sequence
+                    + "，订单ID=" + (event == null ? null : event.getOrderId())
+                    + "，原因=" + ex.getMessage());
         }
 
         @Override
         public void handleOnStartException(Throwable ex) {
-            System.out.println("[start-error] " + ex.getMessage());
+            System.out.println("[启动异常] " + ex.getMessage());
         }
 
         @Override
         public void handleOnShutdownException(Throwable ex) {
-            System.out.println("[shutdown-error] " + ex.getMessage());
+            System.out.println("[关闭异常] " + ex.getMessage());
         }
     }
 }

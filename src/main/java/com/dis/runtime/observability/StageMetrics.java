@@ -3,9 +3,7 @@ package com.dis.runtime.observability;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
-/**
- * 单阶段运行时指标。
- */
+// 单阶段运行时指标。
 public final class StageMetrics {
     private final String stageName;
     private final LongAdder successCount = new LongAdder();
@@ -32,6 +30,7 @@ public final class StageMetrics {
     }
 
     public void recordRetry(long sequence, long latencyNanos, Throwable cause) {
+        // retry 也计入延迟窗口，可反映“最终成功前的真实处理成本”。
         retryCount.increment();
         latencyWindow.recordNanos(latencyNanos);
         lastSequence.set(sequence);
@@ -53,6 +52,7 @@ public final class StageMetrics {
     }
 
     public void recordSkippedPublishFailure(long sequence, Throwable cause) {
+        // 发布阶段失败导致的“有序跳过”，不算业务处理错误。
         skippedCount.increment();
         lastSequence.set(sequence);
         lastErrorMessageText = messageOf(cause);

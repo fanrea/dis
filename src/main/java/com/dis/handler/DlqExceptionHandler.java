@@ -9,6 +9,10 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+// 异步死信异常处理器示例。
+// 设计意图：
+// 1. 主消费线程只负责抛转，避免在异常路径上做重 IO。
+// 2. 通过独立线程池异步处理死信落地。
 public class DlqExceptionHandler<E> implements ExceptionHandler<E> {
     private final ExecutorService executor;
 
@@ -35,21 +39,21 @@ public class DlqExceptionHandler<E> implements ExceptionHandler<E> {
 
     @Override
     public void handleEventException(Throwable ex, long sequence, E event) {
-        System.err.println("DLQ exception, sequence=" + sequence + ", event=" + event);
+        System.err.println("死信异常，序号=" + sequence + "，事件=" + event);
         executor.submit(() -> {
-            // 待实现：将事件异步发送到消息队列或数据库死信表。
+            // 待实现：将异常事件异步发送到消息队列或数据库死信表。
         });
     }
 
     @Override
     public void handleOnStartException(Throwable ex) {
-        System.err.println("DLQ handler start exception");
+        System.err.println("死信处理器启动异常");
         ex.printStackTrace();
     }
 
     @Override
     public void handleOnShutdownException(Throwable ex) {
-        System.err.println("DLQ handler shutdown exception");
+        System.err.println("死信处理器关闭异常");
         ex.printStackTrace();
     }
 }

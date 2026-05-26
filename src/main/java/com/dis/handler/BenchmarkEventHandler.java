@@ -4,7 +4,7 @@ import com.dis.OrderEvent;
 
 import java.util.concurrent.CountDownLatch;
 
-// 压测用事件处理器。
+// 压测示例 handler。
 public class BenchmarkEventHandler implements EventHandler<OrderEvent> {
     private final CountDownLatch completeLatch;
     private final long targetCount;
@@ -21,7 +21,7 @@ public class BenchmarkEventHandler implements EventHandler<OrderEvent> {
         event.setPrice(processedCount);
 
         if (processedCount == targetCount) {
-            System.out.println("Processed " + processedCount + " events");
+            System.out.println("已处理事件数=" + processedCount);
             completeLatch.countDown();
         }
     }

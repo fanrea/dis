@@ -10,11 +10,11 @@ import org.openjdk.jmh.annotations.Mode;
 import org.openjdk.jmh.annotations.OperationsPerInvocation;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
 import org.openjdk.jmh.annotations.Param;
+import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
-import org.openjdk.jmh.annotations.Threads;
-import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
+import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 
 import java.util.ArrayList;
@@ -29,9 +29,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-/**
- * 对比引擎和 BlockingQueue 的基准。
- */
+// 对比引擎与 BlockingQueue 的基准。
 @State(Scope.Benchmark)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 @Fork(1)
@@ -65,7 +63,7 @@ public class EngineVsBlockingQueueBenchmark {
                             .observabilityLogEnabled(false)
                             .build()
             );
-            engine.handleEventsWith("benchmark-stage", (event, sequence) -> onConsumed());
+            engine.handleEventsWith("基准测试阶段", (event, sequence) -> onConsumed());
             engine.start();
         } else {
             queue = new ArrayBlockingQueue<>(4096);
@@ -127,7 +125,7 @@ public class EngineVsBlockingQueueBenchmark {
         }
 
         if (!latch.await(1, TimeUnit.MINUTES)) {
-            throw new IllegalStateException("benchmark timed out");
+            throw new IllegalStateException("基准测试超时");
         }
 
         for (Future<?> future : futures) {
@@ -173,7 +171,7 @@ public class EngineVsBlockingQueueBenchmark {
     private void checkFailure() {
         Throwable error = failure.get();
         if (error != null) {
-            throw new IllegalStateException("benchmark failed", error);
+            throw new IllegalStateException("基准测试失败", error);
         }
     }
 

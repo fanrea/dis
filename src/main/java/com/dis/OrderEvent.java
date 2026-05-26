@@ -1,6 +1,6 @@
 package com.dis;
 
-// 订单事件对象，用于在 RingBuffer 中传递业务数据。
+// 订单事件对象，在 RingBuffer 中复用传递。
 public class OrderEvent {
     private String orderId;
     private String userId;
@@ -20,6 +20,7 @@ public class OrderEvent {
         this.price = price;
     }
 
+    // 供 EventResetter 调用，清理上次事件残留字段。
     public void reset() {
         orderId = null;
         userId = null;
@@ -141,19 +142,19 @@ public class OrderEvent {
 
     @Override
     public String toString() {
-        return "OrderEvent{"
-                + "orderId='" + orderId + '\''
-                + ", userId='" + userId + '\''
-                + ", skuId='" + skuId + '\''
-                + ", price=" + price
-                + ", quantity=" + quantity
-                + ", traceId='" + traceId + '\''
-                + ", orderStatus=" + orderStatus
-                + ", riskPassed=" + riskPassed
-                + ", stockReserved=" + stockReserved
-                + ", createdAtMillis=" + createdAtMillis
-                + ", errorCode='" + errorCode + '\''
-                + ", errorMessage='" + errorMessage + '\''
+        return "订单事件{"
+                + "订单ID='" + orderId + '\''
+                + ", 用户ID='" + userId + '\''
+                + ", 商品ID='" + skuId + '\''
+                + ", 价格=" + price
+                + ", 数量=" + quantity
+                + ", 链路ID='" + traceId + '\''
+                + ", 订单状态=" + orderStatus
+                + ", 风控通过=" + riskPassed
+                + ", 库存已预占=" + stockReserved
+                + ", 创建时间毫秒=" + createdAtMillis
+                + ", 错误码='" + errorCode + '\''
+                + ", 错误信息='" + errorMessage + '\''
                 + '}';
     }
 }
