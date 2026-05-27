@@ -2,21 +2,15 @@ package com.dis.strategy;
 
 import com.dis.core.Sequence;
 
-import java.util.concurrent.locks.LockSupport;
-
-/**
- * 可调参数的让步等待策略。
- *
- * <p>阶段顺序：
- * 1) 有界自旋
- * 2) 有界/无界让步
- * 3) 可选固定时长 park
- *
- * <p>相较旧实现：
- * 1) 各阶段预算可配置
- * 2) 是否退化到 park 可配置
- * 3) 深阶段回弹带滞回阈值，不再单次推进即回弹
- */
+// 可调参数的让步等待策略。
+// 阶段顺序：
+// 1. 有界自旋。
+// 2. 有界或近似无限让步。
+// 3. 可选固定时长 park。
+// 特点：
+// 1. 各阶段预算可配置。
+// 2. 是否退化到 park 可配置。
+// 3. 深阶段回弹带滞回阈值，不再单次推进即回弹。
 public class YieldingWaitStrategy implements WaitStrategy {
     private final int spinTries;
     private final int yieldTries;
@@ -26,6 +20,7 @@ public class YieldingWaitStrategy implements WaitStrategy {
     private final int reboundYieldTries;
     private final long reboundMinProgressDelta;
     private final int reboundMinProgressEvents;
+    private final Parker parker = new Parker();
 
     public YieldingWaitStrategy() {
         this(100, Integer.MAX_VALUE, 0L, 32, 16, 2L, 2);
@@ -149,7 +144,7 @@ public class YieldingWaitStrategy implements WaitStrategy {
             }
 
             if (parkNanos > 0L) {
-                LockSupport.parkNanos(parkNanos);
+                parker.parkNanos(parkNanos, () -> dependentSequence.getVolatile() < sequence);
             } else {
                 Thread.onSpinWait();
             }
@@ -176,6 +171,6 @@ public class YieldingWaitStrategy implements WaitStrategy {
 
     @Override
     public void signalAllWhenBlocking() {
-        // 本策略不依赖阻塞原语，无需显式唤醒。
+        parker.signalAll();
     }
 }

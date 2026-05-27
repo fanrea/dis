@@ -6,6 +6,7 @@ import com.dis.core.MultiProducerSequencer;
 import com.dis.core.Sequence;
 import com.dis.strategy.BatchSignalPolicy;
 import com.dis.strategy.BlockingWaitStrategy;
+import com.dis.strategy.ParkWaitStrategy;
 import com.dis.strategy.PhasedBackoffWaitStrategy;
 import com.dis.strategy.PublishSignalPolicy;
 import com.dis.strategy.RateLimitedSignalPolicy;
@@ -93,6 +94,21 @@ class DefaultEventEngineTest {
 
         long second = sequencer.tryNext(10, TimeUnit.MILLISECONDS);
         assertEquals(-1L, second);
+    }
+
+    @Test
+    void addingGateInvalidatesCachedGatingSequence() {
+        MultiProducerSequencer sequencer = new MultiProducerSequencer(2, new YieldingWaitStrategy());
+
+        assertEquals(0L, sequencer.next());
+        assertEquals(1L, sequencer.next());
+
+        Sequence lateGate = new Sequence(-1);
+        sequencer.addGatingSequence(lateGate);
+
+        assertEquals(-1L, sequencer.tryNext(1, TimeUnit.MILLISECONDS));
+        lateGate.setRelease(0L);
+        assertEquals(2L, sequencer.tryNext(1, TimeUnit.MILLISECONDS));
     }
 
     @Test
@@ -378,6 +394,102 @@ class DefaultEventEngineTest {
     }
 
     @Test
+    void phasedBackoffDelegatesToFallbackAfterTimeBudget() throws Exception {
+        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        WaitStrategy strategy = new PhasedBackoffWaitStrategy(0L, 0L, fallback);
+        Sequence cursor = new Sequence(7L);
+        Sequence dependent = new Sequence(7L);
+
+        long available = strategy.waitFor(10L, cursor, dependent);
+
+        assertEquals(7L, available);
+        assertEquals(1, fallback.waitCount.get());
+    }
+
+    @Test
+    void phasedBackoffSignalWakesFallbackPark() throws Exception {
+        WaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                0L,
+                0L,
+                new ParkWaitStrategy(TimeUnit.SECONDS.toNanos(10))
+        );
+        Sequence cursor = new Sequence(-1);
+        Sequence dependent = new Sequence(-1);
+        CountDownLatch done = new CountDownLatch(1);
+
+        Thread waiter = new Thread(() -> {
+            try {
+                strategy.waitFor(0L, cursor, dependent);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        });
+        waiter.start();
+
+        Thread.sleep(20);
+        dependent.setRelease(0L);
+        strategy.signalAllWhenBlocking();
+
+        assertTrue(done.await(1, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void phasedBackoffAcceptsZeroMinParkNanosWithPositiveMaxParkNanos() throws Exception {
+        WaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                0,
+                0,
+                0L,
+                1_000L,
+                2,
+                0,
+                0
+        );
+        Sequence cursor = new Sequence(0L);
+        Sequence dependent = new Sequence(0L);
+
+        assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
+    }
+
+    @Test
+    void phasedBackoffReboundIsAdaptiveAcrossCalls() throws Exception {
+        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                0L,
+                0L,
+                fallback,
+                TimeUnit.MILLISECONDS.toNanos(50),
+                0L,
+                1L,
+                1
+        );
+        Sequence cursor = new Sequence(0L);
+        Sequence dependent = new Sequence(-1L);
+
+        assertEquals(-1L, strategy.waitFor(0L, cursor, dependent));
+        dependent.setRelease(0L);
+        assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
+
+        CountDownLatch progressed = new CountDownLatch(1);
+        Thread advancer = new Thread(() -> {
+            try {
+                progressed.await(3, TimeUnit.SECONDS);
+                Thread.sleep(5);
+                dependent.setRelease(1L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        advancer.start();
+
+        int fallbackCallsBefore = fallback.waitCount.get();
+        progressed.countDown();
+        assertEquals(1L, strategy.waitFor(1L, cursor, dependent));
+        assertEquals(fallbackCallsBefore, fallback.waitCount.get());
+    }
+
+    @Test
     void phasedBackoffReboundsWhenProgressResumes() throws Exception {
         Sequence cursor = new Sequence(-1);
         Sequence dependent = new Sequence(-1);
@@ -523,6 +635,35 @@ class DefaultEventEngineTest {
         assertEquals(0L, availableRef.get());
     }
 
+    @Test
+    void yieldingWaitStrategySignalWakesParkedWaiter() throws Exception {
+        YieldingWaitStrategy waitStrategy = new YieldingWaitStrategy(
+                0,
+                0,
+                TimeUnit.SECONDS.toNanos(10)
+        );
+        Sequence cursor = new Sequence(-1);
+        Sequence dependent = cursor;
+        CountDownLatch done = new CountDownLatch(1);
+
+        Thread waiter = new Thread(() -> {
+            try {
+                waitStrategy.waitFor(0L, cursor, dependent);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                done.countDown();
+            }
+        });
+        waiter.start();
+
+        Thread.sleep(20);
+        cursor.setRelease(0L);
+        waitStrategy.signalAllWhenBlocking();
+
+        assertTrue(done.await(1, TimeUnit.SECONDS));
+    }
+
     private static OrderEvent copy(OrderEvent source) {
         OrderEvent copy = new OrderEvent();
         copy.setOrderId(source.getOrderId());
@@ -558,9 +699,11 @@ class DefaultEventEngineTest {
 
     private static final class CountingWaitStrategy implements WaitStrategy {
         private final AtomicInteger signalCount = new AtomicInteger();
+        private final AtomicInteger waitCount = new AtomicInteger();
 
         @Override
         public long waitFor(long sequence, Sequence cursor, Sequence dependentSequence) {
+            waitCount.incrementAndGet();
             return dependentSequence.getVolatile();
         }
 

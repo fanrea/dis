@@ -18,11 +18,17 @@ import java.util.concurrent.locks.LockSupport;
 // 3. availableBuffer + flag 记录每个槽位当前发布的是哪一轮 sequence，防止读到上一轮残留。
 // 4. gating sequence 表示消费者处理进度，生产者 claim 前必须确认不会覆盖未消费槽位。
 public final class MultiProducerSequencer implements Sequencer {
+    private static final long CLAIM_TIMEOUT = Long.MIN_VALUE;
+    private static final long GATE_SPIN_BUDGET_NANOS = 10_000L;
+    private static final long GATE_YIELD_BUDGET_NANOS = 50_000L;
+    private static final long GATE_PARK_NANOS = 1_000L;
+
     private final int bufferSize; // RingBuffer 容量。
     private final WaitStrategy waitStrategy; // 生产者等待空间、消费者等待事件时共用的等待策略。
     private final PublishSignalPolicy publishSignalPolicy; // publish 后是否需要唤醒消费者。
     private final Sequence cursor = new Sequence(-1); // 已被生产者认领到的最大 sequence，不代表都已发布完成。
     private volatile Sequence[] gatingSequences; // 所有消费者进度，生产者用它判断 RingBuffer 是否还有可写空间。
+    private volatile long cachedGatingSequence = -1L; // 跨 claim 缓存最慢消费者进度，避免每次申请都扫描所有消费者。
 
     // 按槽位记录发布轮次 flag，消费者据此判断可见性。
     // 同一个数组槽位会被 sequence、sequence + bufferSize、sequence + 2*bufferSize 复用，
@@ -83,30 +89,18 @@ public final class MultiProducerSequencer implements Sequencer {
     // 2. 如果候选 sequence 会绕回覆盖消费者未处理的槽位，就等待 gating sequence 前进。
     // 3. CAS 成功后返回 sequence，调用方填充 RingBuffer 槽位，再调用 publish(sequence)。
     private long claimNext(boolean timed, long timeoutNanos, long startTime) {
-        // 本地缓存最慢消费者进度，只有在接近环绕时才重新扫描 gatingSequences，减少热点路径开销。
-        long cachedGatingSequence = cursor.getVolatile() - bufferSize;//只是初始化一下,让第一次先走一次真实校验
-        //如果当前线程一直cas失败导致cachedGatingSequence与current差距一直大,会一直getMinimumSequence产生消耗,
         while (true) {
             long current = cursor.getVolatile();
             long next = current + 1;
             long wrapPoint = next - bufferSize;
 
-            if (wrapPoint > cachedGatingSequence) {
+            long cached = cachedGatingSequence;
+            if (wrapPoint > cached) {
                 // wrapPoint 是新 sequence 即将覆盖的旧 sequence。
                 // 如果最慢消费者还没有越过 wrapPoint，说明目标槽位仍可能被消费，生产者必须等待。
-                long minSequence = getMinimumSequence(gatingSequences, current);//获取实际的最新被消费位置
-                if (wrapPoint > minSequence) {
-                    if (timed) {
-                        long elapsed = System.nanoTime() - startTime;
-                        if (elapsed >= timeoutNanos) {
-                            return -1L;
-                        }
-                        long remaining = timeoutNanos - elapsed;
-                        LockSupport.parkNanos(Math.min(remaining, 1_000_000L));
-                    } else {
-                        LockSupport.parkNanos(1L);
-                    }
-                    continue;
+                long minSequence = waitForGatingSequence(wrapPoint, current, timed, timeoutNanos, startTime);
+                if (minSequence == CLAIM_TIMEOUT) {
+                    return -1L;
                 }
                 cachedGatingSequence = minSequence;
             }
@@ -115,6 +109,47 @@ public final class MultiProducerSequencer implements Sequencer {
             if (cursor.compareAndSet(current, next)) {
                 return next;
             }
+        }
+    }
+
+    private long waitForGatingSequence(long wrapPoint,
+                                       long current,
+                                       boolean timed,
+                                       long timeoutNanos,
+                                       long startTime) {
+        long waitStart = System.nanoTime();
+        while (true) {
+            long minSequence = getMinimumSequence(gatingSequences, current);
+            if (wrapPoint <= minSequence) {
+                return minSequence;
+            }
+
+            long remaining = Long.MAX_VALUE;
+            if (timed) {
+                long elapsed = System.nanoTime() - startTime;
+                if (elapsed >= timeoutNanos) {
+                    return CLAIM_TIMEOUT;
+                }
+                remaining = timeoutNanos - elapsed;
+            }
+            idleWhenGateUnavailable(waitStart, remaining);
+        }
+    }
+
+    private static void idleWhenGateUnavailable(long waitStart, long remainingNanos) {
+        long elapsed = System.nanoTime() - waitStart;
+        if (elapsed < GATE_SPIN_BUDGET_NANOS) {
+            Thread.onSpinWait();
+            return;
+        }
+        if (elapsed < GATE_SPIN_BUDGET_NANOS + GATE_YIELD_BUDGET_NANOS) {
+            Thread.yield();
+            return;
+        }
+
+        long parkNanos = Math.min(remainingNanos, GATE_PARK_NANOS);
+        if (parkNanos > 0L) {
+            LockSupport.parkNanos(parkNanos);
         }
     }
 
@@ -170,5 +205,7 @@ public final class MultiProducerSequencer implements Sequencer {
         Sequence[] updatedSequences = Arrays.copyOf(currentSequences, currentSequences.length + sequencesToAdd.length);
         System.arraycopy(sequencesToAdd, 0, updatedSequences, currentSequences.length, sequencesToAdd.length);
         this.gatingSequences = updatedSequences;
+        // 新增消费者后必须强制下一次 claim 重新扫描，避免沿用旧缓存覆盖新消费者尚未释放的槽位。
+        this.cachedGatingSequence = cursor.getVolatile() - bufferSize;
     }
 }

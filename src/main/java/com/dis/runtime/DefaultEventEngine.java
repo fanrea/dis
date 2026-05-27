@@ -388,7 +388,7 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
                                         Sequence dependency,
                                         BusinessEventHandler<E>[] handlers,
                                         int stageNo) {
-        // 核心方法：追加广播型 Batch stage。
+        // 核心方法：追加广播型 Batch stage。给runtimes添加处理器
         // 关键点：每个 handler 对应一个独立 BatchEventProcessor；每个 processor 的 sequence 都注册为 gating sequence。
         // batch stage 是广播模式：同一层有几个 handler，就有几个 processor 各自完整消费每个事件。
         Sequence[] stageSequences = new Sequence[handlers.length];
