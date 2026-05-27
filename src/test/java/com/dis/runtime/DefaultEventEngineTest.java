@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -454,7 +455,7 @@ class DefaultEventEngineTest {
 
     @Test
     void phasedBackoffReboundIsAdaptiveAcrossCalls() throws Exception {
-        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        AdvancingWaitStrategy fallback = new AdvancingWaitStrategy();
         PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
                 0L,
                 0L,
@@ -467,8 +468,6 @@ class DefaultEventEngineTest {
         Sequence cursor = new Sequence(0L);
         Sequence dependent = new Sequence(-1L);
 
-        assertEquals(-1L, strategy.waitFor(0L, cursor, dependent));
-        dependent.setRelease(0L);
         assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
 
         CountDownLatch progressed = new CountDownLatch(1);
@@ -490,6 +489,143 @@ class DefaultEventEngineTest {
     }
 
     @Test
+    void phasedBackoffReboundStateIsThreadLocal() throws Exception {
+        AdvancingWaitStrategy fallback = new AdvancingWaitStrategy();
+        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                0L,
+                0L,
+                fallback,
+                TimeUnit.MILLISECONDS.toNanos(50),
+                0L,
+                1L,
+                1
+        );
+        CyclicBarrier barrier = new CyclicBarrier(2);
+        CountDownLatch done = new CountDownLatch(2);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+
+        Thread threadA = new Thread(() -> {
+            try {
+                Sequence cursor = new Sequence(1L);
+                Sequence dependent = new Sequence(0L);
+                assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
+                assertEquals(1L, strategy.waitFor(1L, cursor, dependent));
+
+                barrier.await(3, TimeUnit.SECONDS);
+                int before = fallback.waitCountForCurrentThread();
+                assertEquals(2L, strategy.waitFor(2L, cursor, new DelayedSequence(1L, 2L, 5L)));
+                assertEquals(before, fallback.waitCountForCurrentThread());
+            } catch (Throwable ex) {
+                failure.compareAndSet(null, ex);
+            } finally {
+                done.countDown();
+            }
+        });
+
+        Thread threadB = new Thread(() -> {
+            try {
+                Sequence cursor = new Sequence(0L);
+                Sequence dependent = new Sequence(0L);
+                assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
+
+                barrier.await(3, TimeUnit.SECONDS);
+                int before = fallback.waitCountForCurrentThread();
+                assertEquals(1L, strategy.waitFor(1L, cursor, new DelayedSequence(0L, 1L, 5L)));
+                assertEquals(before + 1, fallback.waitCountForCurrentThread());
+            } catch (Throwable ex) {
+                failure.compareAndSet(null, ex);
+            } finally {
+                done.countDown();
+            }
+        });
+
+        threadA.start();
+        threadB.start();
+
+        assertTrue(done.await(3, TimeUnit.SECONDS));
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+    }
+
+    @Test
+    void phasedBackoffProgressInSpinOrYieldDoesNotTriggerRebound() throws Exception {
+        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                TimeUnit.MILLISECONDS.toNanos(20),
+                0L,
+                fallback,
+                TimeUnit.MILLISECONDS.toNanos(100),
+                0L,
+                1L,
+                1
+        );
+        Sequence cursor = new Sequence(1L);
+
+        assertEquals(1L, strategy.waitFor(1L, cursor, new DelayedSequence(-1L, 1L, 5L)));
+
+        int before = fallback.waitCount.get();
+        assertEquals(2L, strategy.waitFor(2L, cursor, new DelayedSequence(-1L, 2L, 5L)));
+        assertEquals(before, fallback.waitCount.get());
+    }
+
+    @Test
+    void phasedBackoffFallbackProgressTriggersRebound() throws Exception {
+        AdvancingWaitStrategy fallback = new AdvancingWaitStrategy();
+        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                0L,
+                0L,
+                fallback,
+                TimeUnit.MILLISECONDS.toNanos(50),
+                0L,
+                1L,
+                1
+        );
+        Sequence cursor = new Sequence(1L);
+        Sequence dependent = new Sequence(0L);
+
+        assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
+        assertEquals(1L, strategy.waitFor(1L, cursor, dependent));
+
+        int before = fallback.waitCount.get();
+        assertEquals(2L, strategy.waitFor(2L, cursor, new DelayedSequence(1L, 2L, 5L)));
+        assertEquals(before, fallback.waitCount.get());
+    }
+
+    @Test
+    void phasedBackoffZeroBudgetSkipsActiveWait() throws Exception {
+        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(0L, 0L, fallback);
+        Sequence cursor = new Sequence(-1L);
+        Sequence dependent = new Sequence(-1L);
+
+        assertEquals(-1L, strategy.waitFor(0L, cursor, dependent));
+        assertEquals(1, fallback.waitCount.get());
+    }
+
+    @Test
+    void phasedBackoffRejectsReboundBudgetSmallerThanNormalBudget() {
+        assertThrows(IllegalArgumentException.class, () -> new PhasedBackoffWaitStrategy(
+                10L,
+                0L,
+                new CountingWaitStrategy(),
+                9L,
+                0L,
+                1L,
+                1
+        ));
+        assertThrows(IllegalArgumentException.class, () -> new PhasedBackoffWaitStrategy(
+                0L,
+                10L,
+                new CountingWaitStrategy(),
+                0L,
+                9L,
+                1L,
+                1
+        ));
+    }
+
+    @Test
     void phasedBackoffReboundsWhenProgressResumes() throws Exception {
         Sequence cursor = new Sequence(-1);
         Sequence dependent = new Sequence(-1);
@@ -500,7 +636,7 @@ class DefaultEventEngineTest {
                 64_000L,
                 2,
                 32,
-                16,
+                32,
                 4L,
                 2
         );
@@ -544,7 +680,7 @@ class DefaultEventEngineTest {
                 80_000L,
                 2,
                 32,
-                16,
+                32,
                 8L,
                 3
         );
@@ -710,6 +846,54 @@ class DefaultEventEngineTest {
         @Override
         public void signalAllWhenBlocking() {
             signalCount.incrementAndGet();
+        }
+    }
+
+    private static final class AdvancingWaitStrategy implements WaitStrategy {
+        private final AtomicInteger signalCount = new AtomicInteger();
+        private final AtomicInteger waitCount = new AtomicInteger();
+        private final ConcurrentHashMap<Long, AtomicInteger> waitCountByThread = new ConcurrentHashMap<>();
+
+        @Override
+        public long waitFor(long sequence, Sequence cursor, Sequence dependentSequence) {
+            waitCount.incrementAndGet();
+            waitCountByThread
+                    .computeIfAbsent(Thread.currentThread().getId(), ignored -> new AtomicInteger())
+                    .incrementAndGet();
+            dependentSequence.setRelease(sequence);
+            return sequence;
+        }
+
+        @Override
+        public void signalAllWhenBlocking() {
+            signalCount.incrementAndGet();
+        }
+
+        private int waitCountForCurrentThread() {
+            AtomicInteger count = waitCountByThread.get(Thread.currentThread().getId());
+            return count == null ? 0 : count.get();
+        }
+    }
+
+    private static final class DelayedSequence extends Sequence {
+        private final long initialValue;
+        private final long advancedValue;
+        private final long delayNanos;
+        private final long startNanos = System.nanoTime();
+
+        private DelayedSequence(long initialValue, long advancedValue, long delayMillis) {
+            super(initialValue);
+            this.initialValue = initialValue;
+            this.advancedValue = advancedValue;
+            this.delayNanos = TimeUnit.MILLISECONDS.toNanos(delayMillis);
+        }
+
+        @Override
+        public long getVolatile() {
+            if (System.nanoTime() - startNanos >= delayNanos) {
+                return advancedValue;
+            }
+            return initialValue;
         }
     }
 }
