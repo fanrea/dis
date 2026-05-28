@@ -36,7 +36,7 @@ import java.util.concurrent.locks.LockSupport;
 // 默认事件引擎实现，是整个事件流的“总装配器”和“生命周期控制器”。
 // 核心流程：
 // 1. 构造阶段创建 RingBuffer 和 Sequencer，RingBuffer 存事件槽位，Sequencer 分配和发布序号。
-// 2. start 之前通过 handleEventsWith / then 组装 pipeline，每个 stage 都会注册自己的消费序号。
+// 2. start 之前通过 handleEventsWith / then 组装 pipeline，并只把当前链路叶子节点注册为 producer gating。
 // 3. 发布阶段先申请序号，再写入对应槽位，最后发布序号唤醒消费者。
 // 4. 运行阶段由 BatchEventProcessor 或 WorkProcessor 消费事件，并通过 observer 回写指标。
 // 5. 停机阶段分为立即停止和优雅停止，优雅停止会等消费者追上当前 cursor 后再关闭线程。
@@ -98,9 +98,9 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
         if (handlers == null || handlers.length == 0) {
             throw new IllegalArgumentException("处理器不能为空");
         }
-        // 第一层普通 stage 没有上游依赖，所有 handler 都直接等待生产者发布的 sequence。
+        // 第一层普通 stage 没有上游依赖，只添加自己的 leaf gating，不移除任何旧 sequence。
         int stageNo = stageNoGenerator.getAndIncrement();
-        Sequence[] stageSequences = appendBatchStage(stageName, null, handlers, stageNo);
+        Sequence[] stageSequences = appendBatchStage(stageName, null, null, handlers, stageNo);
         // 返回 EventChain 让调用方继续 then，把本 stage 的 sequence 作为下一层依赖。
         return new EventChainImpl(stageSequences);
     }
@@ -114,8 +114,8 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
             throw new IllegalArgumentException("工作线程数量必须大于 0");
         }
         Objects.requireNonNull(handler, "handler");
-        // 第一层 worker pool 没有上游依赖，多个 worker 竞争同一批生产者发布的 sequence。
-        Sequence[] workerSequences = appendWorkerPoolStage(stageName, null, workerCount, handler);
+        // 第一层 worker pool 没有上游依赖，所有 worker private sequence 都成为 leaf gating。
+        Sequence[] workerSequences = appendWorkerPoolStage(stageName, null, null, workerCount, handler);
         return new EventChainImpl(workerSequences);
     }
 
@@ -386,10 +386,11 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
 
     private Sequence[] appendBatchStage(String stageNamePrefix,
                                         Sequence dependency,
+                                        Sequence[] previousLeafSequences,
                                         BusinessEventHandler<E>[] handlers,
                                         int stageNo) {
         // 核心方法：追加广播型 Batch stage。给runtimes添加处理器
-        // 关键点：每个 handler 对应一个独立 BatchEventProcessor；每个 processor 的 sequence 都注册为 gating sequence。
+        // 关键点：每个 handler 对应一个独立 BatchEventProcessor；当前 stage sequences 会成为新的 leaf gating。
         // batch stage 是广播模式：同一层有几个 handler，就有几个 processor 各自完整消费每个事件。
         Sequence[] stageSequences = new Sequence[handlers.length];
         String baseStageName = stageNamePrefix == null || stageNamePrefix.isBlank()
@@ -415,22 +416,24 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
             );
 
             Sequence sequence = processor.getSequence();
-            // gating sequence 告诉生产者：这个消费者没处理完的槽位不能被覆盖。
-            sequencer.addGatingSequence(sequence);
             stageSequences[i] = sequence;
             // runtime 延迟到 start 时再真正拉起线程，配置阶段只保存结构。
             runtimes.add(new BatchStageRuntime(stageName, processor, sequence));
         }
 
+        // 生产者只需要被当前链路叶子节点限制。接在已有链路后面时，上一层 sequence 仍作为 dependency
+        // 被当前 stage 等待，但不再作为 producer gating，减少 claimNext 扫描数量。
+        updateGatingSequencesForNextInChain(previousLeafSequences, stageSequences);
         return stageSequences;
     }
 
     private Sequence[] appendWorkerPoolStage(String stageNamePrefix,
                                              Sequence dependency,
+                                             Sequence[] previousLeafSequences,
                                              int workerCount,
                                              WorkHandler<E> handler) {
         // 核心方法：追加竞争消费型 WorkerPool stage。
-        // 关键点：多个 worker 共享 workSequence 抢任务；每个 worker 的私有 sequence 都注册为 gating sequence。
+        // 关键点：多个 worker 共享 workSequence 抢任务；作为 leaf 时，每个 worker private sequence 都参与 gating。
         // worker pool 是竞争消费模式：同一个事件只会被其中一个 worker 处理。
         // shared workSequence 是 worker 之间抢任务的公共游标，用来决定下一个 sequence 分配给谁。
         Sequence workSequence = new Sequence(-1);
@@ -457,14 +460,32 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
                     workerName,
                     new StageProcessingObserver(stageMetrics)
             );
-            // 每个 worker 的 sequence 都要加入 gating，生产者必须等最慢 worker 释放槽位。
             workerSequences[i] = processor.getSequence();
-            sequencer.addGatingSequence(workerSequences[i]);
             processors.add(processor);
         }
 
         runtimes.add(new WorkerPoolRuntime(baseStageName, processors, workerSequences));
+        // 如果后面再接 stage，workerSequences 会作为 dependency 被 SequenceGroup 等待，
+        // producer gating 则切换到新 stage 的 leaf sequences。
+        updateGatingSequencesForNextInChain(previousLeafSequences, workerSequences);
         return workerSequences;
+    }
+
+    private void updateGatingSequencesForNextInChain(Sequence[] previousLeafSequences,
+                                                     Sequence[] nextLeafSequences) {
+        if (nextLeafSequences == null || nextLeafSequences.length == 0) {
+            throw new IllegalArgumentException("新的 leaf sequence 不能为空");
+        }
+
+        // 必须先添加新 leaf，再移除旧 leaf，保持保守安全语义。
+        sequencer.addGatingSequence(nextLeafSequences);
+        if (previousLeafSequences == null || previousLeafSequences.length == 0) {
+            return;
+        }
+
+        for (Sequence previousLeafSequence : previousLeafSequences) {
+            sequencer.removeGatingSequence(previousLeafSequence);
+        }
     }
 
     private final class EventChainImpl implements EventChain<E> {
@@ -486,8 +507,9 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
                     : new SequenceGroup(dependencies);
 
             int stageNo = stageNoGenerator.getAndIncrement();
-            // 新增的 batch stage 会等待上游 dependency 达到目标 sequence 后才处理事件。
-            dependencies = appendBatchStage(stageName, dependency, handlers, stageNo);
+            Sequence[] previousLeafSequences = dependencies;
+            // 新增的 batch stage 会等待上游 dependency；producer gating 只切换当前链路自己的 leaf。
+            dependencies = appendBatchStage(stageName, dependency, previousLeafSequences, handlers, stageNo);
             return this;
         }
 
@@ -504,7 +526,8 @@ public final class DefaultEventEngine<E> implements EventEngine<E> {
                     ? dependencies[0]
                     : new SequenceGroup(dependencies);
 
-            dependencies = appendWorkerPoolStage(stageName, dependency, workerCount, handler);
+            Sequence[] previousLeafSequences = dependencies;
+            dependencies = appendWorkerPoolStage(stageName, dependency, previousLeafSequences, workerCount, handler);
             return this;
         }
     }

@@ -6,7 +6,10 @@ import com.dis.strategy.AlwaysSignalPolicy;
 
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.LockSupport;
@@ -53,7 +56,7 @@ public final class MultiProducerSequencer implements Sequencer {
         this.bufferSize = bufferSize;
         this.waitStrategy = waitStrategy;
         this.publishSignalPolicy = Objects.requireNonNull(publishSignalPolicy, "publishSignalPolicy");
-        this.gatingSequences = gatingSequences == null ? new Sequence[0] : Arrays.copyOf(gatingSequences, gatingSequences.length);
+        this.gatingSequences = sanitizeGatingSequences(gatingSequences);
         this.availableBuffer = new int[bufferSize];
         this.indexMask = bufferSize - 1;
         this.indexShift = Integer.numberOfTrailingZeros(bufferSize);
@@ -96,7 +99,7 @@ public final class MultiProducerSequencer implements Sequencer {
 
             long cached = cachedGatingSequence;
             if (wrapPoint > cached) {
-                // wrapPoint 是新 sequence 即将覆盖的旧 sequence。
+                // wrapPoint 是即将被下一次写入覆盖的 sequence。
                 // 如果最慢消费者还没有越过 wrapPoint，说明目标槽位仍可能被消费，生产者必须等待。
                 long minSequence = waitForGatingSequence(wrapPoint, current, timed, timeoutNanos, startTime);
                 if (minSequence == CLAIM_TIMEOUT) {
@@ -197,15 +200,83 @@ public final class MultiProducerSequencer implements Sequencer {
 
     @Override
     public synchronized void addGatingSequence(Sequence... sequencesToAdd) {
-        // 配置阶段低频更新，使用 synchronized + copy-on-write 简化并发安全。
         if (sequencesToAdd == null || sequencesToAdd.length == 0) {
             return;
         }
-        Sequence[] currentSequences = this.gatingSequences;
-        Sequence[] updatedSequences = Arrays.copyOf(currentSequences, currentSequences.length + sequencesToAdd.length);
-        System.arraycopy(sequencesToAdd, 0, updatedSequences, currentSequences.length, sequencesToAdd.length);
-        this.gatingSequences = updatedSequences;
-        // 新增消费者后必须强制下一次 claim 重新扫描，避免沿用旧缓存覆盖新消费者尚未释放的槽位。
-        this.cachedGatingSequence = cursor.getVolatile() - bufferSize;
+
+        // 配置阶段低频更新，使用 synchronized + copy-on-write 简化并发安全。
+        Sequence[] current = this.gatingSequences;
+        List<Sequence> updated = new ArrayList<>(current.length + sequencesToAdd.length);
+        Collections.addAll(updated, current);
+
+        for (Sequence sequence : sequencesToAdd) {
+            Objects.requireNonNull(sequence, "gating sequence 不能为空");
+            if (!containsIdentity(updated, sequence)) {
+                updated.add(sequence);
+            }
+        }
+
+        Sequence[] newSequences = updated.toArray(new Sequence[0]);
+        this.gatingSequences = newSequences;
+        refreshCachedGatingSequence(newSequences);
+    }
+
+    @Override
+    public synchronized boolean removeGatingSequence(Sequence sequence) {
+        if (sequence == null) {
+            return false;
+        }
+
+        Sequence[] current = this.gatingSequences;
+        int removeIndex = -1;
+        for (int i = 0; i < current.length; i++) {
+            if (current[i] == sequence) {
+                removeIndex = i;
+                break;
+            }
+        }
+        if (removeIndex < 0) {
+            return false;
+        }
+
+        Sequence[] updated = new Sequence[current.length - 1];
+        System.arraycopy(current, 0, updated, 0, removeIndex);
+        System.arraycopy(current, removeIndex + 1, updated, removeIndex, current.length - removeIndex - 1);
+        this.gatingSequences = updated;
+        refreshCachedGatingSequence(updated);
+        return true;
+    }
+
+    Sequence[] gatingSequencesSnapshot() {
+        return Arrays.copyOf(gatingSequences, gatingSequences.length);
+    }
+
+    private void refreshCachedGatingSequence(Sequence[] sequences) {
+        // gating sequence 变更后必须刷新缓存，新增慢消费者时避免覆盖，移除旧 leaf 时允许生产者看到新的最小 leaf。
+        this.cachedGatingSequence = getMinimumSequence(sequences, cursor.getVolatile());
+    }
+
+    private static Sequence[] sanitizeGatingSequences(Sequence[] sequences) {
+        if (sequences == null || sequences.length == 0) {
+            return new Sequence[0];
+        }
+
+        List<Sequence> sanitized = new ArrayList<>(sequences.length);
+        for (Sequence sequence : sequences) {
+            Objects.requireNonNull(sequence, "gating sequence 不能为空");
+            if (!containsIdentity(sanitized, sequence)) {
+                sanitized.add(sequence);
+            }
+        }
+        return sanitized.toArray(new Sequence[0]);
+    }
+
+    private static boolean containsIdentity(List<Sequence> sequences, Sequence target) {
+        for (Sequence sequence : sequences) {
+            if (sequence == target) {
+                return true;
+            }
+        }
+        return false;
     }
 }

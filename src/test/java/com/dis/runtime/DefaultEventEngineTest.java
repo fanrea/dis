@@ -22,7 +22,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -437,165 +436,14 @@ class DefaultEventEngineTest {
     }
 
     @Test
-    void phasedBackoffAcceptsZeroMinParkNanosWithPositiveMaxParkNanos() throws Exception {
-        WaitStrategy strategy = new PhasedBackoffWaitStrategy(
-                0,
-                0,
-                0L,
-                1_000L,
-                2,
-                0,
-                0
-        );
-        Sequence cursor = new Sequence(0L);
-        Sequence dependent = new Sequence(0L);
-
-        assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
-    }
-
-    @Test
-    void phasedBackoffReboundIsAdaptiveAcrossCalls() throws Exception {
-        AdvancingWaitStrategy fallback = new AdvancingWaitStrategy();
-        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
-                0L,
-                0L,
-                fallback,
-                TimeUnit.MILLISECONDS.toNanos(50),
-                0L,
-                1L,
-                1
-        );
-        Sequence cursor = new Sequence(0L);
-        Sequence dependent = new Sequence(-1L);
-
-        assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
-
-        CountDownLatch progressed = new CountDownLatch(1);
-        Thread advancer = new Thread(() -> {
-            try {
-                progressed.await(3, TimeUnit.SECONDS);
-                Thread.sleep(5);
-                dependent.setRelease(1L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        });
-        advancer.start();
-
-        int fallbackCallsBefore = fallback.waitCount.get();
-        progressed.countDown();
-        assertEquals(1L, strategy.waitFor(1L, cursor, dependent));
-        assertEquals(fallbackCallsBefore, fallback.waitCount.get());
-    }
-
-    @Test
-    void phasedBackoffReboundStateIsThreadLocal() throws Exception {
-        AdvancingWaitStrategy fallback = new AdvancingWaitStrategy();
-        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
-                0L,
-                0L,
-                fallback,
-                TimeUnit.MILLISECONDS.toNanos(50),
-                0L,
-                1L,
-                1
-        );
-        CyclicBarrier barrier = new CyclicBarrier(2);
-        CountDownLatch done = new CountDownLatch(2);
-        AtomicReference<Throwable> failure = new AtomicReference<>();
-
-        Thread threadA = new Thread(() -> {
-            try {
-                Sequence cursor = new Sequence(1L);
-                Sequence dependent = new Sequence(0L);
-                assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
-                assertEquals(1L, strategy.waitFor(1L, cursor, dependent));
-
-                barrier.await(3, TimeUnit.SECONDS);
-                int before = fallback.waitCountForCurrentThread();
-                assertEquals(2L, strategy.waitFor(2L, cursor, new DelayedSequence(1L, 2L, 5L)));
-                assertEquals(before, fallback.waitCountForCurrentThread());
-            } catch (Throwable ex) {
-                failure.compareAndSet(null, ex);
-            } finally {
-                done.countDown();
-            }
-        });
-
-        Thread threadB = new Thread(() -> {
-            try {
-                Sequence cursor = new Sequence(0L);
-                Sequence dependent = new Sequence(0L);
-                assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
-
-                barrier.await(3, TimeUnit.SECONDS);
-                int before = fallback.waitCountForCurrentThread();
-                assertEquals(1L, strategy.waitFor(1L, cursor, new DelayedSequence(0L, 1L, 5L)));
-                assertEquals(before + 1, fallback.waitCountForCurrentThread());
-            } catch (Throwable ex) {
-                failure.compareAndSet(null, ex);
-            } finally {
-                done.countDown();
-            }
-        });
-
-        threadA.start();
-        threadB.start();
-
-        assertTrue(done.await(3, TimeUnit.SECONDS));
-        if (failure.get() != null) {
-            throw new AssertionError(failure.get());
-        }
-    }
-
-    @Test
-    void phasedBackoffProgressInSpinOrYieldDoesNotTriggerRebound() throws Exception {
+    void phasedBackoffShouldFallbackAfterSpinAndYieldTimeout() throws Exception {
         CountingWaitStrategy fallback = new CountingWaitStrategy();
         PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
-                TimeUnit.MILLISECONDS.toNanos(20),
                 0L,
-                fallback,
-                TimeUnit.MILLISECONDS.toNanos(100),
                 0L,
-                1L,
-                1
+                TimeUnit.NANOSECONDS,
+                fallback
         );
-        Sequence cursor = new Sequence(1L);
-
-        assertEquals(1L, strategy.waitFor(1L, cursor, new DelayedSequence(-1L, 1L, 5L)));
-
-        int before = fallback.waitCount.get();
-        assertEquals(2L, strategy.waitFor(2L, cursor, new DelayedSequence(-1L, 2L, 5L)));
-        assertEquals(before, fallback.waitCount.get());
-    }
-
-    @Test
-    void phasedBackoffFallbackProgressTriggersRebound() throws Exception {
-        AdvancingWaitStrategy fallback = new AdvancingWaitStrategy();
-        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
-                0L,
-                0L,
-                fallback,
-                TimeUnit.MILLISECONDS.toNanos(50),
-                0L,
-                1L,
-                1
-        );
-        Sequence cursor = new Sequence(1L);
-        Sequence dependent = new Sequence(0L);
-
-        assertEquals(0L, strategy.waitFor(0L, cursor, dependent));
-        assertEquals(1L, strategy.waitFor(1L, cursor, dependent));
-
-        int before = fallback.waitCount.get();
-        assertEquals(2L, strategy.waitFor(2L, cursor, new DelayedSequence(1L, 2L, 5L)));
-        assertEquals(before, fallback.waitCount.get());
-    }
-
-    @Test
-    void phasedBackoffZeroBudgetSkipsActiveWait() throws Exception {
-        CountingWaitStrategy fallback = new CountingWaitStrategy();
-        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(0L, 0L, fallback);
         Sequence cursor = new Sequence(-1L);
         Sequence dependent = new Sequence(-1L);
 
@@ -604,42 +452,61 @@ class DefaultEventEngineTest {
     }
 
     @Test
-    void phasedBackoffRejectsReboundBudgetSmallerThanNormalBudget() {
-        assertThrows(IllegalArgumentException.class, () -> new PhasedBackoffWaitStrategy(
-                10L,
+    void phasedBackoffShouldReturnWithoutFallbackWhenSequenceAvailableDuringSpin() throws Exception {
+        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                20L,
                 0L,
-                new CountingWaitStrategy(),
-                9L,
-                0L,
-                1L,
-                1
-        ));
-        assertThrows(IllegalArgumentException.class, () -> new PhasedBackoffWaitStrategy(
-                0L,
-                10L,
-                new CountingWaitStrategy(),
-                0L,
-                9L,
-                1L,
-                1
-        ));
+                TimeUnit.MILLISECONDS,
+                fallback
+        );
+        Sequence cursor = new Sequence(1L);
+
+        assertEquals(1L, strategy.waitFor(1L, cursor, new DelayedSequence(-1L, 1L, 5L)));
+        assertEquals(0, fallback.waitCount.get());
     }
 
     @Test
-    void phasedBackoffReboundsWhenProgressResumes() throws Exception {
+    void phasedBackoffShouldDelegateSignalToFallback() {
+        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        PhasedBackoffWaitStrategy strategy = new PhasedBackoffWaitStrategy(
+                1L,
+                1L,
+                TimeUnit.MILLISECONDS,
+                fallback
+        );
+
+        strategy.signalAllWhenBlocking();
+
+        assertEquals(1, fallback.signalCount.get());
+    }
+
+    @Test
+    void phasedBackoffTryConstructorsCreateUsableStrategies() throws Exception {
+        WaitStrategy fixedPark = new PhasedBackoffWaitStrategy(1, 1, 1_000L);
+
+        Sequence cursor = new Sequence(0L);
+        Sequence dependent = new Sequence(0L);
+
+        assertEquals(0L, fixedPark.waitFor(0L, cursor, dependent));
+    }
+
+    @Test
+    void phasedBackoffZeroTimeoutShouldImmediatelyFallback() throws Exception {
+        CountingWaitStrategy fallback = new CountingWaitStrategy();
+        WaitStrategy strategy = new PhasedBackoffWaitStrategy(0L, 0L, TimeUnit.NANOSECONDS, fallback);
+        Sequence cursor = new Sequence(-1L);
+        Sequence dependent = new Sequence(-1L);
+
+        assertEquals(-1L, strategy.waitFor(0L, cursor, dependent));
+        assertEquals(1, fallback.waitCount.get());
+    }
+
+    @Test
+    void phasedBackoffProgressesWhenTrafficResumes() throws Exception {
         Sequence cursor = new Sequence(-1);
         Sequence dependent = new Sequence(-1);
-        WaitStrategy strategy = new PhasedBackoffWaitStrategy(
-                0,
-                0,
-                1_000L,
-                64_000L,
-                2,
-                32,
-                32,
-                4L,
-                2
-        );
+        WaitStrategy strategy = PhasedBackoffWaitStrategy.withPark(0L, 0L, TimeUnit.NANOSECONDS, 1_000L);
 
         CountDownLatch done = new CountDownLatch(1);
         AtomicReference<Long> elapsed = new AtomicReference<>();
@@ -670,20 +537,10 @@ class DefaultEventEngineTest {
     }
 
     @Test
-    void phasedBackoffReboundUsesHysteresisNotSingleTick() throws Exception {
+    void phasedBackoffCanWaitThroughMultipleProgressTicks() throws Exception {
         Sequence cursor = new Sequence(-1);
         Sequence dependent = new Sequence(-1);
-        WaitStrategy strategy = new PhasedBackoffWaitStrategy(
-                0,
-                0,
-                5_000L,
-                80_000L,
-                2,
-                32,
-                32,
-                8L,
-                3
-        );
+        WaitStrategy strategy = PhasedBackoffWaitStrategy.withPark(0L, 0L, TimeUnit.NANOSECONDS, 5_000L);
 
         CountDownLatch done = new CountDownLatch(1);
         AtomicReference<Long> elapsed = new AtomicReference<>();
@@ -700,12 +557,12 @@ class DefaultEventEngineTest {
         });
         waiter.start();
 
-        // 先给一次小推进，不应触发激进回弹。
+        // 先给一次小推进，等待线程应继续阻塞到目标 sequence 可见。
         Thread.sleep(4);
         dependent.setRelease(1);
         Thread.sleep(4);
 
-        // 再给连续推进，达到阈值后应回弹并较快完成。
+        // 目标 sequence 可见后，等待线程应及时返回。
         for (int i = 2; i <= 6; i++) {
             dependent.setRelease(i);
             Thread.sleep(1);
@@ -846,32 +703,6 @@ class DefaultEventEngineTest {
         @Override
         public void signalAllWhenBlocking() {
             signalCount.incrementAndGet();
-        }
-    }
-
-    private static final class AdvancingWaitStrategy implements WaitStrategy {
-        private final AtomicInteger signalCount = new AtomicInteger();
-        private final AtomicInteger waitCount = new AtomicInteger();
-        private final ConcurrentHashMap<Long, AtomicInteger> waitCountByThread = new ConcurrentHashMap<>();
-
-        @Override
-        public long waitFor(long sequence, Sequence cursor, Sequence dependentSequence) {
-            waitCount.incrementAndGet();
-            waitCountByThread
-                    .computeIfAbsent(Thread.currentThread().getId(), ignored -> new AtomicInteger())
-                    .incrementAndGet();
-            dependentSequence.setRelease(sequence);
-            return sequence;
-        }
-
-        @Override
-        public void signalAllWhenBlocking() {
-            signalCount.incrementAndGet();
-        }
-
-        private int waitCountForCurrentThread() {
-            AtomicInteger count = waitCountByThread.get(Thread.currentThread().getId());
-            return count == null ? 0 : count.get();
         }
     }
 

@@ -17,6 +17,18 @@ public interface Sequencer {
     // 注册 gating sequence，防止生产者覆盖未消费槽位。
     void addGatingSequence(Sequence... sequencesToAdd);
 
+    // 移除不再是 leaf 的 gating sequence。
+    boolean removeGatingSequence(Sequence sequence);
+
+    default void removeGatingSequences(Sequence... sequences) {
+        if (sequences == null) {
+            return;
+        }
+        for (Sequence sequence : sequences) {
+            removeGatingSequence(sequence);
+        }
+    }
+
     // 阻塞申请下一个 sequence。
     long next();
 
